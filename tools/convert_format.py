@@ -9,9 +9,6 @@ JSON 格式轉換工具
    - Chinese: zh_instruction / zh_input / zh_output -> instruction / input / output
      並透過 OpenCC 將簡體中文轉為繁體中文。
 2) 保留舊功能：prompt/completion -> instruction/input/output
-3) 支援 CodeFeedback-Python105K：query/response -> instruction/input/output
-4) 支援 python_code_instructions_18k_alpaca：instruction/input/output（含 prompt 回填）
-5) 支援 Stable-Code-Python-SFT：instruction/output(jsonl.gz) -> instruction/input/output
 """
 
 import argparse

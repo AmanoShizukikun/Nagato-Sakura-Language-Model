@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Iterator, Optional, Any
 
@@ -42,10 +43,17 @@ class TokenizerManager:
         texts_iterator: Iterator[str],
         vocab_size: int,
         min_frequency: int = 2,
+        total_texts: Optional[int] = None,
+        num_threads: int = 0,
     ):
         """創建並訓練分詞器"""
         try:
             from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors, trainers
+
+            # 讓 Rust tokenizers 明確啟用平行化，並允許手動指定執行緒。
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+            if num_threads and int(num_threads) > 0:
+                os.environ["RAYON_NUM_THREADS"] = str(max(1, int(num_threads)))
             
             # 創建BPE分詞器
             tokenizer = Tokenizer(models.BPE())
@@ -65,7 +73,11 @@ class TokenizerManager:
             
             # 訓練
             self.logger.info(f"開始訓練分詞器，目標詞彙量: {vocab_size}")
-            tokenizer.train_from_iterator(texts_iterator, trainer=trainer)
+            if total_texts is not None and total_texts > 0:
+                self.logger.info(f"分詞器語料總文本數: {total_texts}")
+                tokenizer.train_from_iterator(texts_iterator, trainer=trainer, length=int(total_texts))
+            else:
+                tokenizer.train_from_iterator(texts_iterator, trainer=trainer)
             
             # 保存
             tokenizer.save(str(self.tokenizer_path))
@@ -95,6 +107,8 @@ class TokenizerManager:
         target_vocab_size: int,
         force_retrain: bool = False,
         min_frequency: int = 2,
+        max_training_samples: int = 0,
+        num_threads: int = 0,
     ):
         """準備分詞器"""
 
@@ -138,33 +152,48 @@ class TokenizerManager:
         
         if force_retrain or not self.transformers_tokenizer:
             self.logger.info("訓練新分詞器...")
-            
-            # 收集文本
-            all_texts = []
-            for item in tqdm(training_data, desc="收集文本"):
+            sample_cap = int(max_training_samples) if max_training_samples else 0
+            if sample_cap > 0:
+                training_subset = training_data[:sample_cap]
+                self.logger.info(f"分詞器訓練樣本上限: {sample_cap}（實際使用 {len(training_subset)} 筆）")
+            else:
+                training_subset = training_data
+                if len(training_subset) > 1_000_000:
+                    self.logger.warning(
+                        "分詞器訓練樣本超過 100 萬，可能耗時很長。"
+                        "可使用 --tokenizer_train_max_samples 限制樣本數以提速。"
+                    )
+
+            valid_sample_count = 0
+            for item in tqdm(training_subset, desc="統計分詞樣本"):
                 if not isinstance(item, dict):
                     continue
-
                 instruction, input_text, output = _extract_supervised_fields(item)
-                if not instruction or not output:
-                    continue
+                if instruction and output:
+                    valid_sample_count += 1
 
-                instruction_with_input = f"{instruction}\n{input_text}".strip() if input_text else instruction
-                all_texts.append(instruction_with_input)
-                all_texts.append(output)
-            
-            if not all_texts:
+            if valid_sample_count <= 0:
                 raise ValueError("沒有收集到用於訓練分詞器的文本")
-            
-            # 訓練分詞器
+
+            total_texts = valid_sample_count * 2
+
             def text_iterator():
-                for text in all_texts:
-                    yield text
+                for item in training_subset:
+                    if not isinstance(item, dict):
+                        continue
+                    instruction, input_text, output = _extract_supervised_fields(item)
+                    if not instruction or not output:
+                        continue
+                    instruction_with_input = f"{instruction}\n{input_text}".strip() if input_text else instruction
+                    yield instruction_with_input
+                    yield output
             
             self.create_and_train_tokenizer(
                 text_iterator(),
                 target_vocab_size,
                 min_frequency=min_frequency,
+                total_texts=total_texts,
+                num_threads=num_threads,
             )
         
         if self.transformers_tokenizer is None:

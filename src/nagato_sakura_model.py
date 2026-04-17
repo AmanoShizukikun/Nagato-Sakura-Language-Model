@@ -1336,7 +1336,6 @@ class NagatoSakuraForCausalLM(nn.Module):
 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -1346,6 +1345,8 @@ class NagatoSakuraForCausalLM(nn.Module):
             
             # 計算損失
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            if shift_logits.dtype in (torch.float16, torch.bfloat16):
+                shift_logits = shift_logits.float()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)

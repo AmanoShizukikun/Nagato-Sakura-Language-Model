@@ -4,14 +4,19 @@ import json
 import time
 import warnings
 import math
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from functools import partial
 from collections import defaultdict
+import contextlib
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from transformers import (
@@ -42,34 +47,104 @@ except ImportError:
         def update(self): pass
         def unscale_(self, optimizer): pass
         def is_enabled(self): return False
-    def autocast(enabled=False):
-        import contextlib
+    def autocast(enabled=False, dtype=None):
         return contextlib.nullcontext()
+
+
+class _NoOpMetricsWriter:
+    def log_step_metrics(self, row: Dict[str, Any]):
+        return None
+
+    def log_eval_metrics(self, row: Dict[str, Any]):
+        return None
+
+    def log_event(self, row: Dict[str, Any]):
+        return None
+
+    def log_checkpoint_metrics(self, row: Dict[str, Any]):
+        return None
+
+    def log_training_summary(self, row: Dict[str, Any]):
+        return None
 
 
 class AdvancedNagatoSakuraTrainer:
     """長門櫻訓練器"""
     
-    def __init__(self, model_config: Optional[NSConfig], output_dir: str = "nagato_sakura_output",
-                 device: Optional[str] = None, use_wandb: bool = False, project_name: str = "nagato-sakura"):
+    def __init__(
+        self,
+        model_config: Optional[NSConfig],
+        output_dir: str = "nagato_sakura_output",
+        device: Optional[str] = None,
+        use_wandb: bool = False,
+        project_name: str = "nagato-sakura",
+        precision: str = "auto",
+        is_distributed: bool = False,
+        rank: int = 0,
+        local_rank: int = 0,
+        world_size: int = 1,
+    ):
         
         # 基礎設置
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        self.rank = int(rank)
+        self.local_rank = int(local_rank)
+        self.world_size = max(1, int(world_size))
+        self.is_distributed = bool(is_distributed and self.world_size > 1)
+        self.is_main_process = (not self.is_distributed) or self.rank == 0
+
+        if self.is_distributed and torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        else:
+            self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
         
         # 初始化日誌
-        self.logger = setup_logging(str(self.output_dir))
+        if self.is_main_process:
+            self.logger = setup_logging(str(self.output_dir))
+        else:
+            self.logger = logging.getLogger(f"{__name__}.rank{self.rank}")
+            self.logger.handlers.clear()
+            self.logger.propagate = False
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.WARNING)
+
         self.logger.info(f"使用設備: {self.device}")
+        self.logger.info(
+            f"分散式狀態 - enabled: {self.is_distributed}, rank: {self.rank}, "
+            f"local_rank: {self.local_rank}, world_size: {self.world_size}"
+        )
+
+        self.requested_precision = str(precision).strip().lower()
+        self.precision_profile = self._resolve_precision_profile(self.requested_precision)
+        self.logger.info(
+            "精度策略 - requested: %s, actual: %s, model_dtype: %s, autocast_dtype: %s, grad_scaler: %s",
+            self.requested_precision,
+            self.precision_profile["actual_precision"],
+            self.precision_profile["model_dtype"],
+            self.precision_profile["autocast_dtype"],
+            self.precision_profile["use_grad_scaler"],
+        )
         
         # 系統監控
         self.system_monitor = SystemMonitor()
-        self.system_monitor.log_system_status(self.logger)
-        self.metrics_writer = CSVMetricsWriter(str(self.output_dir))
+        if self.is_main_process:
+            self.system_monitor.log_system_status(self.logger)
+        self.metrics_writer = CSVMetricsWriter(str(self.output_dir)) if self.is_main_process else _NoOpMetricsWriter()
         
         # 模型相關
         self.model_config = model_config
-        self.model: Optional[NagatoSakuraForCausalLM] = None
+        self.model: Optional[torch.nn.Module] = None
         self.tokenizer_manager = TokenizerManager(self.output_dir / "tokenizer.json")
         
         # 訓練狀態
@@ -87,8 +162,8 @@ class AdvancedNagatoSakuraTrainer:
             self.best_checkpoint_path = best_model_dir
         
         # WandB集成
-        self.use_wandb = use_wandb
-        if use_wandb:
+        self.use_wandb = bool(use_wandb and self.is_main_process)
+        if self.use_wandb:
             try:
                 wandb.init(project=project_name, dir=str(self.output_dir))
                 self.logger.info("WandB 初始化成功")
@@ -105,6 +180,86 @@ class AdvancedNagatoSakuraTrainer:
         except Exception as e:
             self.logger.info(f"未找到現有分詞器或加載失敗: {e}")
 
+    def _resolve_precision_profile(self, requested_precision: str) -> Dict[str, Any]:
+        requested = requested_precision.lower()
+        valid_modes = {"auto", "fp32", "fp16", "bf16"}
+        if requested not in valid_modes:
+            raise ValueError(f"不支援的 precision 模式: {requested_precision}")
+
+        if self.device.type != "cuda":
+            return {
+                "actual_precision": "fp32",
+                "use_autocast": False,
+                "autocast_dtype": None,
+                "model_dtype": torch.float32,
+                "use_grad_scaler": False,
+            }
+
+        bf16_supported = bool(
+            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        )
+
+        if requested == "auto":
+            if bf16_supported:
+                actual = "bf16"
+            elif AMP_AVAILABLE:
+                actual = "fp16"
+            else:
+                actual = "fp32"
+        elif requested == "bf16":
+            if bf16_supported:
+                actual = "bf16"
+            else:
+                fallback = "fp16" if AMP_AVAILABLE else "fp32"
+                self.logger.warning(f"當前設備不支援 bf16，回退至 {fallback}")
+                actual = fallback
+        elif requested == "fp16":
+            if AMP_AVAILABLE:
+                actual = "fp16"
+            else:
+                self.logger.warning("目前環境不支援 AMP fp16，回退至 fp32")
+                actual = "fp32"
+        else:
+            actual = "fp32"
+
+        use_autocast = AMP_AVAILABLE and actual in {"fp16", "bf16"}
+        autocast_dtype = None
+        if actual == "bf16":
+            autocast_dtype = torch.bfloat16
+        elif actual == "fp16":
+            autocast_dtype = torch.float16
+
+        model_dtype = torch.bfloat16 if actual == "bf16" else torch.float32
+        use_grad_scaler = bool(actual == "fp16" and AMP_AVAILABLE)
+
+        return {
+            "actual_precision": actual,
+            "use_autocast": use_autocast,
+            "autocast_dtype": autocast_dtype,
+            "model_dtype": model_dtype,
+            "use_grad_scaler": use_grad_scaler,
+        }
+
+    def _autocast_context(self):
+        if not self.precision_profile["use_autocast"] or self.device.type != "cuda":
+            return contextlib.nullcontext()
+        autocast_dtype = self.precision_profile.get("autocast_dtype")
+        if autocast_dtype is None:
+            return autocast(enabled=True)
+        return autocast(enabled=True, dtype=autocast_dtype)
+
+    def _unwrap_model(self) -> NagatoSakuraForCausalLM:
+        if isinstance(self.model, DDP):
+            return self.model.module  # type: ignore[return-value]
+        return self.model  # type: ignore[return-value]
+
+    def _all_ranks_true(self, condition: bool) -> bool:
+        if not self.is_distributed:
+            return condition
+        cond_tensor = torch.tensor(1 if condition else 0, device=self.device, dtype=torch.int32)
+        dist.all_reduce(cond_tensor, op=dist.ReduceOp.MIN)
+        return bool(cond_tensor.item())
+
     def initialize_model(self):
         """初始化模型"""
         if self.model_config is None:
@@ -120,9 +275,28 @@ class AdvancedNagatoSakuraTrainer:
         
         # 創建模型
         try:
-            self.model = NagatoSakuraForCausalLM(self.model_config).to(self.device)
+            base_model = NagatoSakuraForCausalLM(self.model_config)
+            base_model = base_model.to(
+                device=self.device,
+                dtype=self.precision_profile["model_dtype"],
+            )
 
-            param_stats = self.model.get_parameter_stats()
+            if self.is_distributed:
+                if self.device.type == "cuda":
+                    self.model = DDP(
+                        base_model,
+                        device_ids=[self.local_rank],
+                        output_device=self.local_rank,
+                        find_unused_parameters=False,
+                    )
+                else:
+                    self.model = DDP(base_model, find_unused_parameters=False)
+            else:
+                self.model = base_model
+
+            model_for_stats = self._unwrap_model()
+
+            param_stats = model_for_stats.get_parameter_stats()
             total_params = param_stats["total_params"]
             trainable_params = param_stats["trainable_params"]
             embedding_params = param_stats["embedding_params"]
@@ -160,7 +334,7 @@ class AdvancedNagatoSakuraTrainer:
             self.logger.debug(f"參數記憶體估算(目前dtype): {param_stats['parameter_memory_gb']:.2f}GB")
 
             if getattr(self.model_config, "gradient_checkpointing", False):
-                self.model.model.enable_gradient_checkpointing()
+                model_for_stats.model.enable_gradient_checkpointing()
                 self.logger.info("已根據配置啟用梯度檢查點")
             
             if self.use_wandb:
@@ -332,6 +506,8 @@ class AdvancedNagatoSakuraTrainer:
         force_retrain_tokenizer: bool = False,
         tokenizer_min_frequency: int = 2,
         eval_data_file: Optional[str] = None,
+        tokenizer_train_max_samples: int = 0,
+        tokenizer_num_threads: int = 0,
     ) -> Tuple[List[Dict[str, str]], Optional[List[Dict[str, str]]]]:
         """準備訓練/評估數據並訓練分詞器。"""
 
@@ -369,6 +545,8 @@ class AdvancedNagatoSakuraTrainer:
             target_vocab_size,
             force_retrain_tokenizer,
             min_frequency=tokenizer_min_frequency,
+            max_training_samples=tokenizer_train_max_samples,
+            num_threads=tokenizer_num_threads,
         )
 
         return train_data, fixed_eval_data
@@ -429,6 +607,10 @@ class AdvancedNagatoSakuraTrainer:
         warmup_ratio: float,
         lr_scheduler_type: str,
         scheduler_target_epochs: Optional[int] = None,
+        dataloader_num_workers: Optional[int] = None,
+        dataloader_prefetch_factor: int = 2,
+        dataloader_persistent_workers: bool = True,
+        dataloader_drop_last: bool = True,
     ):
         """設置訓練組件"""
         
@@ -440,19 +622,40 @@ class AdvancedNagatoSakuraTrainer:
             pack_sequences=True
         )
         
-        num_workers = min(4, os.cpu_count() // 2) if os.cpu_count() else 0
-        if sys.platform == "win32":
-            num_workers = 0  # Windows兼容性
-        
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            collate_fn=collate_fn,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=self.device.type == 'cuda',
-            drop_last=True  # 確保批次大小一致
-        )
+        if dataloader_num_workers is None or dataloader_num_workers < 0:
+            if sys.platform == "win32":
+                num_workers = 0
+            else:
+                cpu_count = os.cpu_count() or 2
+                num_workers = min(8, max(2, cpu_count // 2))
+        else:
+            num_workers = max(0, int(dataloader_num_workers))
+
+        train_sampler: Optional[DistributedSampler] = None
+        if self.is_distributed:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=bool(dataloader_drop_last),
+            )
+
+        train_loader_kwargs: Dict[str, Any] = {
+            "dataset": train_dataset,
+            "batch_size": batch_size,
+            "collate_fn": collate_fn,
+            "shuffle": train_sampler is None,
+            "sampler": train_sampler,
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == 'cuda',
+            "drop_last": bool(dataloader_drop_last),
+        }
+        if num_workers > 0:
+            train_loader_kwargs["persistent_workers"] = bool(dataloader_persistent_workers)
+            train_loader_kwargs["prefetch_factor"] = max(1, int(dataloader_prefetch_factor))
+
+        train_dataloader = DataLoader(**train_loader_kwargs)
         
         # 優化器（使用更先進的配置）
         no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
@@ -504,23 +707,27 @@ class AdvancedNagatoSakuraTrainer:
             )
         
         # 混合精度
-        scaler = GradScaler(enabled=AMP_AVAILABLE and self.device.type == 'cuda')
+        scaler = GradScaler(enabled=bool(self.precision_profile["use_grad_scaler"] and self.device.type == 'cuda'))
+        global_effective_batch = batch_size * gradient_accumulation_steps * (self.world_size if self.is_distributed else 1)
         
         self.logger.info(f"訓練組件設置完成:")
         self.logger.info(f"  批次大小: {batch_size}")
         self.logger.info(f"  梯度累積步數: {gradient_accumulation_steps}")
-        self.logger.info(f"  有效批次大小: {batch_size * gradient_accumulation_steps}")
+        self.logger.info(f"  有效批次大小(全域): {global_effective_batch}")
         self.logger.info(f"  總訓練步數: {total_steps}")
         self.logger.info(f"  預熱步數: {warmup_steps}")
         self.logger.info(f"  調度器目標Epoch: {effective_epochs}")
         self.logger.info(f"  學習率調度器: {lr_scheduler_type}")
+        self.logger.info(f"  DataLoader workers: {num_workers}")
+        self.logger.info(f"  DataLoader drop_last: {bool(dataloader_drop_last)}")
         self.logger.info(f"  混合精度: {'啟用' if scaler.is_enabled() else '禁用'}")
         
-        return train_dataloader, optimizer, scheduler, scaler
+        return train_dataloader, optimizer, scheduler, scaler, train_sampler
 
     def train_epoch(
         self,
         train_dataloader: DataLoader,
+        train_sampler: Optional[DistributedSampler],
         optimizer,
         scheduler,
         scaler: GradScaler,
@@ -549,13 +756,21 @@ class AdvancedNagatoSakuraTrainer:
         log_interval_steps = max(1, total_steps // max(1, log_steps_per_epoch))
         metrics_log_interval_steps = max(1, metrics_log_interval_steps)
 
+        if train_sampler is not None:
+            train_sampler.set_epoch(self.current_epoch)
+
         progress_bar = tqdm(
             train_dataloader,
             desc=f"Epoch {self.current_epoch + 1}",
-            leave=False
+            leave=False,
+            disable=not self.is_main_process,
         )
 
         for step, batch in enumerate(progress_bar):
+            local_batch_valid = batch["input_ids"] is not None
+            if not self._all_ranks_true(local_batch_valid):
+                invalid_batches += 1
+                continue
             if batch["input_ids"] is None:
                 invalid_batches += 1
                 continue
@@ -567,7 +782,7 @@ class AdvancedNagatoSakuraTrainer:
             epoch_tokens += batch_tokens
             accumulated_tokens += batch_tokens
 
-            with autocast(enabled=scaler.is_enabled()):
+            with self._autocast_context():
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -576,21 +791,24 @@ class AdvancedNagatoSakuraTrainer:
                 )
                 loss = outputs.loss
 
-            if loss is None or torch.isnan(loss) or torch.isinf(loss):
+            local_loss_valid = bool(loss is not None and torch.isfinite(loss).item())
+            if not self._all_ranks_true(local_loss_valid):
                 invalid_loss_count += 1
-                self.logger.warning(f"檢測到無效損失，跳過此批次: {loss}")
-                self.metrics_writer.log_event({
-                    "epoch": self.current_epoch + 1,
-                    "global_step": self.global_step,
-                    "event_type": "invalid_loss",
-                    "severity": "WARNING",
-                    "message": "loss is nan/inf or missing",
-                    "value": str(loss),
-                })
+                if self.is_main_process:
+                    self.logger.warning(f"檢測到無效損失，跳過此批次: {loss}")
+                    self.metrics_writer.log_event({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "event_type": "invalid_loss",
+                        "severity": "WARNING",
+                        "message": "loss is nan/inf or missing",
+                        "value": str(loss),
+                    })
                 accumulated_steps = 0
                 accumulated_tokens = 0
                 skipped_update_count += 1
                 optimizer.zero_grad(set_to_none=True)
+                del outputs
                 continue
 
             loss = loss / gradient_accumulation_steps
@@ -611,17 +829,19 @@ class AdvancedNagatoSakuraTrainer:
                 )
                 grad_norm_value = float(grad_norm)
 
-                if not math.isfinite(grad_norm_value):
+                grad_norm_is_finite = math.isfinite(grad_norm_value)
+                if not self._all_ranks_true(grad_norm_is_finite):
                     invalid_grad_count += 1
-                    self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
-                    self.metrics_writer.log_event({
-                        "epoch": self.current_epoch + 1,
-                        "global_step": self.global_step,
-                        "event_type": "invalid_grad_norm",
-                        "severity": "WARNING",
-                        "message": "grad norm is nan/inf",
-                        "value": str(grad_norm),
-                    })
+                    if self.is_main_process:
+                        self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
+                        self.metrics_writer.log_event({
+                            "epoch": self.current_epoch + 1,
+                            "global_step": self.global_step,
+                            "event_type": "invalid_grad_norm",
+                            "severity": "WARNING",
+                            "message": "grad norm is nan/inf",
+                            "value": str(grad_norm),
+                        })
                     accumulated_steps = 0
                     accumulated_tokens = 0
                     skipped_update_count += 1
@@ -652,7 +872,7 @@ class AdvancedNagatoSakuraTrainer:
                     "Step": self.global_step
                 })
 
-                if self.global_step % log_interval_steps == 0:
+                if self.is_main_process and self.global_step % log_interval_steps == 0:
                     self.logger.info(
                         f"Step {self.global_step}: Loss={avg_loss:.4f}, "
                         f"LR={current_lr:.2e}, GradNorm={grad_norm_value:.4f}"
@@ -667,7 +887,7 @@ class AdvancedNagatoSakuraTrainer:
                             "global_step": self.global_step,
                         })
 
-                if self.global_step % metrics_log_interval_steps == 0:
+                if self.is_main_process and self.global_step % metrics_log_interval_steps == 0:
                     elapsed = max(1e-6, time.time() - epoch_start_time)
                     tokens_per_sec = epoch_tokens / elapsed
                     gpu_memory_mb = 0.0
@@ -693,7 +913,7 @@ class AdvancedNagatoSakuraTrainer:
                     })
                     accumulated_tokens = 0
 
-                if self.global_step % (log_interval_steps * 5) == 0:
+                if self.is_main_process and self.global_step % (log_interval_steps * 5) == 0:
                     self.system_monitor.log_system_status(self.logger)
 
         if accumulated_steps > 0:
@@ -705,7 +925,7 @@ class AdvancedNagatoSakuraTrainer:
                 )
                 grad_norm_value = float(grad_norm)
 
-                if math.isfinite(grad_norm_value):
+                if self._all_ranks_true(math.isfinite(grad_norm_value)):
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
@@ -733,21 +953,23 @@ class AdvancedNagatoSakuraTrainer:
         if total_seen_batches > 0:
             invalid_ratio = invalid_batches / total_seen_batches
             if invalid_ratio > 0.3:
-                self.logger.warning(
-                    f"偵測到較高無效批次比例: {invalid_ratio:.1%} ({invalid_batches}/{total_seen_batches})"
-                )
-                self.metrics_writer.log_event({
-                    "epoch": self.current_epoch + 1,
-                    "global_step": self.global_step,
-                    "event_type": "high_invalid_batch_ratio",
-                    "severity": "WARNING",
-                    "message": "invalid batch ratio exceeded 30%",
-                    "value": invalid_ratio,
-                })
+                if self.is_main_process:
+                    self.logger.warning(
+                        f"偵測到較高無效批次比例: {invalid_ratio:.1%} ({invalid_batches}/{total_seen_batches})"
+                    )
+                    self.metrics_writer.log_event({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "event_type": "high_invalid_batch_ratio",
+                        "severity": "WARNING",
+                        "message": "invalid batch ratio exceeded 30%",
+                        "value": invalid_ratio,
+                    })
 
         avg_epoch_loss = epoch_loss / num_batches
         return {
             "avg_loss": avg_epoch_loss,
+            "loss_sum": epoch_loss,
             "num_batches": num_batches,
             "invalid_batches": invalid_batches,
             "invalid_ratio": invalid_ratio,
@@ -814,7 +1036,7 @@ class AdvancedNagatoSakuraTrainer:
         }
         
         with torch.no_grad():
-            for batch in tqdm(eval_dataloader, desc="評估中", leave=False):
+            for batch in tqdm(eval_dataloader, desc="評估中", leave=False, disable=not self.is_main_process):
                 if batch["input_ids"] is None:
                     continue
                 
@@ -822,7 +1044,7 @@ class AdvancedNagatoSakuraTrainer:
                 attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
                 labels = batch["labels"].to(self.device, non_blocking=True)
                 
-                with autocast(enabled=AMP_AVAILABLE and self.device.type == 'cuda'):
+                with self._autocast_context():
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -856,14 +1078,15 @@ class AdvancedNagatoSakuraTrainer:
 
                 valid_token_losses = token_losses[valid_mask]
                 if torch.isnan(valid_token_losses).any() or torch.isinf(valid_token_losses).any():
-                    self.metrics_writer.log_event({
-                        "epoch": self.current_epoch + 1,
-                        "global_step": self.global_step,
-                        "event_type": "invalid_eval_token_loss",
-                        "severity": "WARNING",
-                        "message": "eval token loss has nan/inf",
-                        "value": "",
-                    })
+                    if self.is_main_process:
+                        self.metrics_writer.log_event({
+                            "epoch": self.current_epoch + 1,
+                            "global_step": self.global_step,
+                            "event_type": "invalid_eval_token_loss",
+                            "severity": "WARNING",
+                            "message": "eval token loss has nan/inf",
+                            "value": "",
+                        })
                     del outputs, logits, shift_logits, shift_labels, token_losses, valid_mask, valid_token_losses
                     continue
 
@@ -892,6 +1115,32 @@ class AdvancedNagatoSakuraTrainer:
                 
                 # 釋放評估時的計算圖與張量
                 del outputs, logits, shift_logits, shift_labels, token_losses, valid_mask, valid_token_losses
+
+        if self.is_distributed:
+            totals_tensor = torch.tensor(
+                [total_nll_sum, float(total_tokens), float(num_batches)],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(totals_tensor, op=dist.ReduceOp.SUM)
+            total_nll_sum = float(totals_tensor[0].item())
+            total_tokens = int(totals_tensor[1].item())
+            num_batches = int(totals_tensor[2].item())
+
+            for bucket_name, stats in bucket_raw.items():
+                bucket_tensor = torch.tensor(
+                    [
+                        float(stats["loss_sum"]),
+                        float(stats["tokens"]),
+                        float(stats["samples"]),
+                    ],
+                    device=self.device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(bucket_tensor, op=dist.ReduceOp.SUM)
+                stats["loss_sum"] = float(bucket_tensor[0].item())
+                stats["tokens"] = int(bucket_tensor[1].item())
+                stats["samples"] = int(bucket_tensor[2].item())
         
         bucket_metrics = self._finalize_bucket_metrics(bucket_raw)
 
@@ -934,12 +1183,16 @@ class AdvancedNagatoSakuraTrainer:
         eval_loss: Optional[float] = None,
     ) -> Optional[Path]:
         """保存檢查點"""
+        if not self.is_main_process:
+            return None
+
         checkpoint_dir = self.output_dir / checkpoint_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         try:
             # 模型狀態
-            torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
+            model_to_save = self._unwrap_model()
+            torch.save(model_to_save.state_dict(), checkpoint_dir / "model.pt")
             
             # 配置
             with open(checkpoint_dir / "config.json", 'w', encoding='utf-8') as f:
@@ -1017,11 +1270,14 @@ class AdvancedNagatoSakuraTrainer:
             # 加載模型
             model_path = checkpoint_path / "model.pt"
             if model_path.exists():
-                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                model_to_load = self._unwrap_model()
+                model_to_load.load_state_dict(torch.load(model_path, map_location=self.device))
                 self.best_checkpoint_path = checkpoint_path
             
             self.logger.info(f"檢查點加載成功: {checkpoint_dir}")
             self.logger.info(f"恢復至 Epoch {self.current_epoch}, Step {self.global_step}")
+            if self.is_distributed:
+                dist.barrier()
             return True
             
         except Exception as e:
@@ -1045,7 +1301,8 @@ class AdvancedNagatoSakuraTrainer:
             return False
 
         try:
-            self.model.load_state_dict(torch.load(target_path, map_location=self.device))
+            model_to_load = self._unwrap_model()
+            model_to_load.load_state_dict(torch.load(target_path, map_location=self.device))
             return True
         except Exception as e:
             self.logger.warning(f"回滾最佳模型失敗: {e}")
@@ -1163,7 +1420,7 @@ class AdvancedNagatoSakuraTrainer:
         train_dataset: Dataset,
         eval_dataset: Optional[Dataset] = None,
         batch_size: int = 4,
-        num_epochs: int = 3,
+        num_epochs: int = 100,
         learning_rate: float = 5e-5,
         gradient_accumulation_steps: int = 1,
         weight_decay: float = 0.01,
@@ -1171,14 +1428,14 @@ class AdvancedNagatoSakuraTrainer:
         warmup_ratio: float = 0.03,
         max_grad_norm: float = 1.0,
         log_interval: int = 1,
-        save_interval_epochs: int = 2,
-        early_stopping_patience: int = 5,
+        save_interval_epochs: int = 10,
+        early_stopping_patience: int = 60,
         early_stopping_monitor: str = "eval_loss",
         early_stopping_min_delta: Optional[float] = None,
-        early_stopping_warmup_epochs: int = 0,
+        early_stopping_warmup_epochs: int = 8,
         resume_from_checkpoint: bool = True,
-        eval_interval_epochs: int = 1,
-        metrics_log_interval_steps: int = 50,
+        eval_interval_epochs: int = 5,
+        metrics_log_interval_steps: int = 100,
         save_best_k: int = 3,
         save_latest_k: int = 2,
         save_on_improve_delta: float = 0.001,
@@ -1186,6 +1443,10 @@ class AdvancedNagatoSakuraTrainer:
         scheduler_target_epochs: Optional[int] = None,
         eval_short_max_tokens: int = 64,
         eval_medium_max_tokens: int = 256,
+        dataloader_num_workers: Optional[int] = None,
+        dataloader_prefetch_factor: int = 2,
+        dataloader_persistent_workers: bool = True,
+        dataloader_drop_last: bool = True,
     ):
         """主訓練函數"""
 
@@ -1215,7 +1476,7 @@ class AdvancedNagatoSakuraTrainer:
             )
 
         if scheduler_target_epochs is None and early_stopping_patience > 0:
-            scheduler_target_epochs = min(num_epochs, max(20, early_stopping_patience * 3))
+            scheduler_target_epochs = min(num_epochs, max(30, early_stopping_patience * 2))
 
         self.checkpoint_manager = CheckpointManager(
             output_dir=self.output_dir,
@@ -1229,7 +1490,7 @@ class AdvancedNagatoSakuraTrainer:
             logger=self.logger,
         )
 
-        train_dataloader, optimizer, scheduler, scaler = self.setup_training_components(
+        train_dataloader, optimizer, scheduler, scaler, train_sampler = self.setup_training_components(
             train_dataset,
             batch_size,
             num_epochs,
@@ -1239,6 +1500,10 @@ class AdvancedNagatoSakuraTrainer:
             warmup_ratio,
             lr_scheduler_type,
             scheduler_target_epochs=scheduler_target_epochs,
+            dataloader_num_workers=dataloader_num_workers,
+            dataloader_prefetch_factor=dataloader_prefetch_factor,
+            dataloader_persistent_workers=dataloader_persistent_workers,
+            dataloader_drop_last=dataloader_drop_last,
         )
 
         eval_dataloader = None
@@ -1250,17 +1515,32 @@ class AdvancedNagatoSakuraTrainer:
                 pack_sequences=False
             )
 
+            eval_sampler: Optional[DistributedSampler] = None
+            if self.is_distributed:
+                eval_sampler = DistributedSampler(
+                    eval_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+
             eval_dataloader = DataLoader(
                 eval_dataset,
                 batch_size=batch_size * 2,
                 collate_fn=collate_fn,
                 shuffle=False,
+                sampler=eval_sampler,
                 num_workers=0,
                 pin_memory=self.device.type == 'cuda'
             )
 
         if resume_from_checkpoint:
-            latest_checkpoint = self.find_latest_checkpoint()
+            latest_checkpoint = self.find_latest_checkpoint() if self.is_main_process else None
+            if self.is_distributed:
+                broadcast_objects: List[Optional[str]] = [latest_checkpoint]
+                dist.broadcast_object_list(broadcast_objects, src=0)
+                latest_checkpoint = broadcast_objects[0]
             if latest_checkpoint and self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
                 self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
 
@@ -1284,6 +1564,7 @@ class AdvancedNagatoSakuraTrainer:
 
                 epoch_stats = self.train_epoch(
                     train_dataloader,
+                    train_sampler,
                     optimizer,
                     scheduler,
                     scaler,
@@ -1292,15 +1573,43 @@ class AdvancedNagatoSakuraTrainer:
                     log_steps_per_epoch=10,
                     metrics_log_interval_steps=metrics_log_interval_steps,
                 )
-                epoch_loss = float(epoch_stats["avg_loss"])
+
+                if self.is_distributed:
+                    stats_tensor = torch.tensor(
+                        [
+                            float(epoch_stats.get("loss_sum", 0.0)),
+                            float(epoch_stats.get("num_batches", 0)),
+                            float(epoch_stats.get("tokens_seen", 0)),
+                            float(epoch_stats.get("invalid_loss_count", 0)),
+                            float(epoch_stats.get("invalid_grad_count", 0)),
+                            float(epoch_stats.get("skipped_update_count", 0)),
+                        ],
+                        device=self.device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+
+                    global_num_batches = int(stats_tensor[1].item())
+                    epoch_loss = (
+                        float(stats_tensor[0].item() / global_num_batches)
+                        if global_num_batches > 0
+                        else float("inf")
+                    )
+                    run_aggregates["tokens_seen"] += int(stats_tensor[2].item())
+                    run_aggregates["invalid_loss_count"] += int(stats_tensor[3].item())
+                    run_aggregates["invalid_grad_count"] += int(stats_tensor[4].item())
+                    run_aggregates["skipped_update_count"] += int(stats_tensor[5].item())
+                else:
+                    epoch_loss = float(epoch_stats["avg_loss"])
+                    run_aggregates["tokens_seen"] += int(epoch_stats.get("tokens_seen", 0))
+                    run_aggregates["invalid_loss_count"] += int(epoch_stats.get("invalid_loss_count", 0))
+                    run_aggregates["invalid_grad_count"] += int(epoch_stats.get("invalid_grad_count", 0))
+                    run_aggregates["skipped_update_count"] += int(epoch_stats.get("skipped_update_count", 0))
+
                 self.training_history['train_loss'].append(epoch_loss)
                 epochs_completed += 1
-                run_aggregates["tokens_seen"] += int(epoch_stats.get("tokens_seen", 0))
-                run_aggregates["invalid_loss_count"] += int(epoch_stats.get("invalid_loss_count", 0))
-                run_aggregates["invalid_grad_count"] += int(epoch_stats.get("invalid_grad_count", 0))
-                run_aggregates["skipped_update_count"] += int(epoch_stats.get("skipped_update_count", 0))
 
-                should_log_details = (log_interval <= 1) or ((epoch + 1) % log_interval == 0)
+                should_log_details = self.is_main_process and ((log_interval <= 1) or ((epoch + 1) % log_interval == 0))
                 if should_log_details:
                     self.logger.info(f"Epoch {epoch + 1} 完成 - 平均損失: {epoch_loss:.4f}")
 
@@ -1367,6 +1676,7 @@ class AdvancedNagatoSakuraTrainer:
                     elif eval_loss is not None and math.isfinite(float(eval_loss)):
                         early_stop_score = float(eval_loss)
 
+                early_stop_triggered = False
                 if self.early_stopping and early_stop_score is not None:
                     if (epoch + 1) <= early_stopping_warmup_epochs:
                         if should_log_details:
@@ -1375,27 +1685,35 @@ class AdvancedNagatoSakuraTrainer:
                                 f"monitor: {early_stopping_monitor}, score: {early_stop_score:.6f}"
                             )
                     else:
-                        should_stop = self.early_stopping(early_stop_score)
-                        if should_log_details:
-                            self.logger.info(
-                                f"早停監控({early_stopping_monitor}={early_stop_score:.6f}) - "
-                                f"patience剩餘: {self.early_stopping.patience_remaining}/"
-                                f"{self.early_stopping.patience}"
-                            )
-                        if should_stop:
-                            early_stopped = True
-                            run_status = "early_stopped"
-                            self.logger.info(f"早停觸發! monitor={early_stopping_monitor}, score={early_stop_score:.6f}")
-                            self.metrics_writer.log_event({
-                                "epoch": epoch + 1,
-                                "global_step": self.global_step,
-                                "event_type": "early_stopping",
-                                "severity": "INFO",
-                                "message": f"early stopping triggered on {early_stopping_monitor}",
-                                "value": early_stop_score,
-                            })
+                        if self.is_main_process:
+                            early_stop_triggered = self.early_stopping(early_stop_score)
+                            if should_log_details:
+                                self.logger.info(
+                                    f"早停監控({early_stopping_monitor}={early_stop_score:.6f}) - "
+                                    f"patience剩餘: {self.early_stopping.patience_remaining}/"
+                                    f"{self.early_stopping.patience}"
+                                )
                 elif self.early_stopping and should_log_details and early_stopping_monitor == "eval_loss":
                     self.logger.info("早停監控(eval_loss) - 本epoch無評估結果，略過")
+
+                if self.is_distributed:
+                    stop_tensor = torch.tensor(1 if early_stop_triggered else 0, device=self.device, dtype=torch.int32)
+                    dist.broadcast(stop_tensor, src=0)
+                    early_stop_triggered = bool(stop_tensor.item())
+
+                if early_stop_triggered:
+                    early_stopped = True
+                    run_status = "early_stopped"
+                    if self.is_main_process:
+                        self.logger.info(f"早停觸發! monitor={early_stopping_monitor}, score={early_stop_score:.6f}")
+                        self.metrics_writer.log_event({
+                            "epoch": epoch + 1,
+                            "global_step": self.global_step,
+                            "event_type": "early_stopping",
+                            "severity": "INFO",
+                            "message": f"early stopping triggered on {early_stopping_monitor}",
+                            "value": early_stop_score,
+                        })
 
                 save_reasons = self.checkpoint_manager.should_save(
                     epoch=epoch,
@@ -1513,25 +1831,26 @@ class AdvancedNagatoSakuraTrainer:
             raise
         finally:
             checkpoint_overview = {}
-            if self.checkpoint_manager is not None:
+            if self.is_main_process and self.checkpoint_manager is not None:
                 try:
                     checkpoint_overview = self.checkpoint_manager.export_index(self.output_dir / "metrics")
                 except Exception as e:
                     self.logger.warning(f"checkpoint 索引匯出失敗: {e}")
 
-            try:
-                self._export_training_summary(
-                    run_status=run_status,
-                    epochs_planned=num_epochs,
-                    epochs_completed=epochs_completed,
-                    run_start_time=run_start_time,
-                    run_aggregates=run_aggregates,
-                    eval_history=eval_history,
-                    final_eval_metrics=final_eval_metrics,
-                    checkpoint_overview=checkpoint_overview,
-                )
-            except Exception as e:
-                self.logger.warning(f"訓練摘要匯出失敗: {e}")
+            if self.is_main_process:
+                try:
+                    self._export_training_summary(
+                        run_status=run_status,
+                        epochs_planned=num_epochs,
+                        epochs_completed=epochs_completed,
+                        run_start_time=run_start_time,
+                        run_aggregates=run_aggregates,
+                        eval_history=eval_history,
+                        final_eval_metrics=final_eval_metrics,
+                        checkpoint_overview=checkpoint_overview,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"訓練摘要匯出失敗: {e}")
 
             if self.use_wandb:
                 wandb.finish()
