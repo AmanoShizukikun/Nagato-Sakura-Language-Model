@@ -117,11 +117,12 @@ class NagatoSakuraInference:
         """加載模型和分詞器"""
         try:
             # 使用TokenizerManager加載分詞器
-            self.logger.info(f"加載分詞器: {self.config.tokenizer_path}")
             self.tokenizer_manager = TokenizerManager(Path(self.config.tokenizer_path))
             self.tokenizer_manager.load_tokenizer()
             self.tokenizer = self.tokenizer_manager.transformers_tokenizer
-            self.logger.info(f"分詞器加載完成，詞彙量: {self.tokenizer.vocab_size}")
+            self.logger.info(
+                f"分詞器就緒: {self.config.tokenizer_path} (詞彙量 {self.tokenizer.vocab_size})"
+            )
             
             # 加載模型配置
             config_path = Path(self.config.model_path) / "config.json"
@@ -179,10 +180,39 @@ class NagatoSakuraInference:
             # 移動到設備並設置評估模式
             self.model.to(self.device)
             self.model.eval()
-            
-            # 計算參數數量
-            total_params = sum(p.numel() for p in self.model.parameters())
-            self.logger.info(f"模型參數數量: {total_params/1e6:.2f}M")
+
+            # 模型規模摘要（參數量不含 tokenizer 檔案）
+            param_stats = self.model.get_parameter_stats()
+            self.logger.info(
+                f"模型參數量: {param_stats['total_params']/1e6:.2f}M"
+            )
+            self.logger.info(
+                f"參數組成: Embedding {param_stats['embedding_params']/1e6:.2f}M "
+                f"+ 非Embedding {param_stats['non_embedding_params']/1e6:.2f}M"
+            )
+
+            tokenizer_file = Path(self.config.tokenizer_path)
+            if tokenizer_file.exists():
+                tokenizer_size_bytes = tokenizer_file.stat().st_size
+                tokenizer_size_mb = tokenizer_size_bytes / (1024 ** 2)
+                tokenizer_ratio = (tokenizer_size_bytes / max(1, param_stats["parameter_memory_bytes"])) * 100.0
+                self.logger.info(
+                    f"Tokenizer檔案: {tokenizer_size_mb:.2f}MB "
+                    f"(約 {tokenizer_ratio:.2f}% 參數記憶體)"
+                )
+            else:
+                self.logger.info("Tokenizer檔案: 未找到（不影響模型參數統計）")
+
+            # 詳細拆分放在 DEBUG，避免預設輸出過於冗長。
+            self.logger.debug(f"可訓練參數: {param_stats['trainable_params']/1e6:.2f}M")
+            self.logger.debug(
+                f"Embedding矩陣: {param_stats['vocab_size']} x {param_stats['hidden_size']}"
+            )
+            if param_stats["lm_head_tied_with_embedding"]:
+                self.logger.debug("LM Head參數: 0 (與Embedding共享權重)")
+            else:
+                self.logger.debug(f"LM Head參數: {param_stats['lm_head_params']/1e6:.2f}M")
+            self.logger.debug(f"參數記憶體估算(目前dtype): {param_stats['parameter_memory_gb']:.2f}GB")
             
         except Exception as e:
             self.logger.error(f"加載模型或分詞器失敗: {e}")
@@ -192,7 +222,10 @@ class NagatoSakuraInference:
         """準備輸入"""
         # 添加BOS令牌
         bos = self.tokenizer.bos_token or "<s>"
-        formatted_prompt = f"{bos}{prompt}"
+        normalized_prompt = str(prompt).strip()
+        if normalized_prompt and not normalized_prompt.endswith("長門櫻："):
+            normalized_prompt = f"{normalized_prompt}\n長門櫻："
+        formatted_prompt = f"{bos}{normalized_prompt}"
         
         # 編碼
         input_ids = self.tokenizer.encode(
@@ -608,7 +641,7 @@ def main():
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-0.5/checkpoint-epoch-15", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-0.8/best_model", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式
@@ -623,7 +656,7 @@ def main():
     # 生成參數
     parser.add_argument("--temperature", type=float, default=0.7, help="溫度參數")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k參數")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p參數")
+    parser.add_argument("--top_p", type=float, default=0.95, help="Top-p參數")
     parser.add_argument("--repetition_penalty", type=float, default=1.1, help="重複懲罰")
     parser.add_argument("--no_sample", action="store_true", help="禁用採樣（使用貪婪解碼）")
 

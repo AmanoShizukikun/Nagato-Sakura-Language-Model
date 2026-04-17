@@ -7,6 +7,54 @@ import json
 import time
 
 
+def _clean_optional_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if text.lower() in {"", "none", "null", "n/a", "nan"}:
+        return ""
+    return text
+
+
+def _normalize_supervised_item(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    if not isinstance(item, dict):
+        return None
+
+    candidates = [
+        (item.get("instruction"), item.get("input"), item.get("output")),
+        (item.get("zh_instruction"), item.get("zh_input"), item.get("zh_output")),
+        (item.get("en_instruction"), item.get("en_input"), item.get("en_output")),
+        (item.get("prompt"), "", item.get("completion")),
+    ]
+
+    for instruction_raw, input_raw, output_raw in candidates:
+        if not isinstance(instruction_raw, str) or not isinstance(output_raw, str):
+            continue
+
+        instruction = _clean_optional_text(instruction_raw)
+        output = output_raw.strip()
+        input_text = _clean_optional_text(input_raw)
+
+        if not instruction or not output:
+            continue
+
+        return {
+            "instruction": instruction,
+            "input": input_text,
+            "output": output,
+        }
+
+    return None
+
+
+def _compose_instruction_text(item: Dict[str, str]) -> str:
+    instruction = _clean_optional_text(item.get("instruction"))
+    input_text = _clean_optional_text(item.get("input"))
+    if input_text:
+        return f"{instruction}\n{input_text}".strip()
+    return instruction
+
+
 def _tokenize_batch_with_fallback(
     tokenizer: PreTrainedTokenizerFast,
     texts: List[str],
@@ -122,8 +170,9 @@ class ConversationDataProcessor:
         completion = last_assistant_turn["content"]
         
         return {
-            "prompt": prompt,
-            "completion": completion,
+            "instruction": prompt,
+            "input": "",
+            "output": completion,
             "conversation_id": conversation.conversation_id
         }
     
@@ -146,10 +195,9 @@ def smart_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizer
     # 過濾無效數據
     valid_batch = []
     for item in batch:
-        if (item and isinstance(item, dict) and 
-            "prompt" in item and "completion" in item and
-            item["prompt"] and item["completion"]):
-            valid_batch.append(item)
+        normalized_item = _normalize_supervised_item(item) if item and isinstance(item, dict) else None
+        if normalized_item:
+            valid_batch.append(normalized_item)
     
     if not valid_batch:
         return {"input_ids": None, "attention_mask": None, "labels": None}
@@ -166,13 +214,13 @@ def smart_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizer
     prompt_lengths = []
     
     for item in valid_batch:
-        prompt = str(item["prompt"]).strip()
-        completion = str(item["completion"]).strip()
-        full_text = f"{bos}{prompt}{completion}{eos}"
+        prompt = _compose_instruction_text(item)
+        completion = str(item["output"]).strip()
+        full_text = f"{bos}{prompt}\n{completion}{eos}"
         full_texts.append(full_text)
         
         # 計算prompt長度（包含BOS）
-        prompt_with_bos = f"{bos}{prompt}"
+        prompt_with_bos = f"{bos}{prompt}\n"
         prompt_length = len(tokenizer.encode(prompt_with_bos, add_special_tokens=False))
         prompt_lengths.append(prompt_length)
     
@@ -225,6 +273,13 @@ def stream_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenize
     # 簡化版本，主要用於推理
     texts = []
     for item in batch:
+        normalized_item = _normalize_supervised_item(item) if isinstance(item, dict) else None
+        if normalized_item:
+            composed_prompt = _compose_instruction_text(normalized_item)
+            if composed_prompt:
+                texts.append(composed_prompt)
+                continue
+
         if "text" in item:
             texts.append(item["text"])
         elif "prompt" in item:
@@ -252,22 +307,27 @@ class EarlyStoppingCallback:
         self.best_score = None
         self.patience_counter = 0
         self.should_stop = False
+        self.last_improved = False
     
     def __call__(self, current_score: float) -> bool:
+        self.last_improved = False
         if self.best_score is None:
             self.best_score = current_score
+            self.last_improved = True
             return False
         
         if self.mode == 'min':
             if current_score < self.best_score - self.min_delta:
                 self.best_score = current_score
                 self.patience_counter = 0
+                self.last_improved = True
             else:
                 self.patience_counter += 1
         else:  # mode == 'max'
             if current_score > self.best_score + self.min_delta:
                 self.best_score = current_score
                 self.patience_counter = 0
+                self.last_improved = True
             else:
                 self.patience_counter += 1
         
@@ -275,6 +335,10 @@ class EarlyStoppingCallback:
             self.should_stop = True
             return True
         return False
+
+    @property
+    def patience_remaining(self) -> int:
+        return max(0, self.patience - self.patience_counter)
 
 class StreamingDataLoader:
     """流式數據加載器，用於處理大型對話數據集"""
@@ -322,6 +386,21 @@ class StreamingDataLoader:
                                 turns=turns,
                                 metadata=item.get("metadata")
                             )
+                        elif "instruction" in item and "output" in item:
+                            instruction = _clean_optional_text(item.get("instruction"))
+                            input_text = _clean_optional_text(item.get("input"))
+                            prompt_text = f"{instruction}\n{input_text}".strip() if input_text else instruction
+                            output_text = str(item.get("output", "")).strip()
+                            if prompt_text and output_text:
+                                turns = [
+                                    {"role": "user", "content": prompt_text},
+                                    {"role": "assistant", "content": output_text}
+                                ]
+                                yield ConversationSample(
+                                    conversation_id=item.get("id", str(time.time())),
+                                    turns=turns,
+                                    metadata=item.get("metadata")
+                                )
         except Exception as e:
             logging.getLogger(__name__).error(f"加載對話數據失敗: {e}")
     

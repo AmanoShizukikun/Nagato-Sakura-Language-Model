@@ -9,7 +9,6 @@ import time
 import json
 import logging
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
@@ -507,7 +506,7 @@ class NSConfig:
     
     # 對話相關配置
     conversation_template: str = "nagato_sakura" 
-    system_message: str = "你是長門櫻，一個友善且樂於助人的AI助手。"
+    system_message: str = "你是長門櫻，由天野靜樹創造的金髮狐耳獸娘女僕。"
     
     # 生成相關參數
     max_new_tokens: int = 512
@@ -948,11 +947,11 @@ class NagatoSakuraModel(nn.Module):
         """應用權重初始化"""
         self.apply(self._init_weights)
         
-        # 記錄參數數量
+        # 避免與訓練/推理啟動摘要重複，細節改為 debug 級別。
         num_params = sum(p.numel() for p in self.parameters())
         num_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"模型參數數量: {num_params/1e6:.2f}M")
-        logger.info(f"可訓練參數數量: {num_trainable_params/1e6:.2f}M")
+        logger.debug(f"模型參數數量: {num_params/1e6:.2f}M")
+        logger.debug(f"可訓練參數數量: {num_trainable_params/1e6:.2f}M")
 
     def enable_gradient_checkpointing(self):
         """啟用梯度檢查點以節省記憶體"""
@@ -1932,27 +1931,54 @@ class NagatoSakuraForCausalLM(nn.Module):
             logger.error(f"加載預訓練模型失敗: {e}")
             raise
 
+    def get_parameter_stats(self) -> Dict[str, Any]:
+        """獲取統一口徑的參數統計（不含 tokenizer 檔案）。"""
+        total_params = int(sum(p.numel() for p in self.parameters()))
+        trainable_params = int(sum(p.numel() for p in self.parameters() if p.requires_grad))
+
+        embedding_params = int(self.model.embed_tokens.weight.numel())
+        lm_head_tied = bool(getattr(self.config, "tie_word_embeddings", False))
+        lm_head_params = 0 if lm_head_tied else int(self.lm_head.weight.numel())
+        non_embedding_params = int(total_params - embedding_params)
+
+        parameter_memory_bytes = int(sum(p.numel() * p.element_size() for p in self.parameters()))
+
+        return {
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "embedding_params": embedding_params,
+            "non_embedding_params": non_embedding_params,
+            "lm_head_params": lm_head_params,
+            "lm_head_tied_with_embedding": lm_head_tied,
+            "vocab_size": int(self.config.vocab_size),
+            "hidden_size": int(self.config.hidden_size),
+            "parameter_memory_bytes": parameter_memory_bytes,
+            "parameter_memory_mb": parameter_memory_bytes / (1024 ** 2),
+            "parameter_memory_gb": parameter_memory_bytes / (1024 ** 3),
+            "fp32_estimated_memory_mb": (total_params * 4) / (1024 ** 2),
+            "fp16_estimated_memory_mb": (total_params * 2) / (1024 ** 2),
+        }
+
     def get_model_info(self) -> Dict[str, Any]:
         """獲取模型詳細信息"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        param_stats = self.get_parameter_stats()
         
         # 計算各部分參數
-        embedding_params = self.model.embed_tokens.weight.numel()
         decoder_params = sum(p.numel() for layer in self.model.layers for p in layer.parameters())
-        head_params = self.lm_head.weight.numel()
         norm_params = self.model.final_layernorm.weight.numel()
         
         info = {
             "model_type": "NagatoSakuraForCausalLM",
             "config": self.config.to_dict(),
             "parameters": {
-                "total": total_params,
-                "trainable": trainable_params,
-                "embedding": embedding_params,
+                "total": param_stats["total_params"],
+                "trainable": param_stats["trainable_params"],
+                "embedding": param_stats["embedding_params"],
+                "non_embedding": param_stats["non_embedding_params"],
                 "decoder": decoder_params,
-                "lm_head": head_params,
-                "layer_norm": norm_params
+                "lm_head": param_stats["lm_head_params"],
+                "lm_head_tied_with_embedding": param_stats["lm_head_tied_with_embedding"],
+                "layer_norm": norm_params,
             },
             "memory_usage": self.model.get_memory_usage() if hasattr(self.model, 'get_memory_usage') else {},
             "device": str(next(self.parameters()).device),

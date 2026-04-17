@@ -30,14 +30,19 @@ class TokenizerManager:
                     eos_token="</s>",
                     mask_token="<mask>"
                 )
-                self.logger.info(f"分詞器已加載，詞彙量: {self.transformers_tokenizer.vocab_size}")
+                self.logger.debug(f"分詞器已加載，詞彙量: {self.transformers_tokenizer.vocab_size}")
             except Exception as e:
                 self.logger.error(f"分詞器加載失敗: {e}")
                 raise
         else:
             raise FileNotFoundError("分詞器文件不存在")
     
-    def create_and_train_tokenizer(self, texts_iterator: Iterator[str], vocab_size: int):
+    def create_and_train_tokenizer(
+        self,
+        texts_iterator: Iterator[str],
+        vocab_size: int,
+        min_frequency: int = 2,
+    ):
         """創建並訓練分詞器"""
         try:
             from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors, trainers
@@ -54,7 +59,7 @@ class TokenizerManager:
             trainer = trainers.BpeTrainer(
                 vocab_size=vocab_size,
                 special_tokens=special_tokens,
-                min_frequency=2,
+                min_frequency=max(1, int(min_frequency)),
                 show_progress=True
             )
             
@@ -84,9 +89,43 @@ class TokenizerManager:
             self.logger.error(f"分詞器訓練失敗: {e}")
             raise
     
-    def prepare_tokenizer(self, training_data: list, target_vocab_size: int, 
-                         force_retrain: bool = False):
+    def prepare_tokenizer(
+        self,
+        training_data: list,
+        target_vocab_size: int,
+        force_retrain: bool = False,
+        min_frequency: int = 2,
+    ):
         """準備分詞器"""
+
+        def _clean_optional_text(value: Any) -> str:
+            if not isinstance(value, str):
+                return ""
+            text = value.strip()
+            if text.lower() in {"", "none", "null", "n/a", "nan"}:
+                return ""
+            return text
+
+        def _extract_supervised_fields(item: dict) -> tuple[str, str, str]:
+            candidates = [
+                (item.get("instruction"), item.get("input"), item.get("output")),
+                (item.get("zh_instruction"), item.get("zh_input"), item.get("zh_output")),
+                (item.get("en_instruction"), item.get("en_input"), item.get("en_output")),
+                (item.get("prompt"), "", item.get("completion")),
+            ]
+
+            for instruction_raw, input_raw, output_raw in candidates:
+                if not isinstance(instruction_raw, str) or not isinstance(output_raw, str):
+                    continue
+
+                instruction = _clean_optional_text(instruction_raw)
+                output = output_raw.strip()
+                input_text = _clean_optional_text(input_raw)
+                if instruction and output:
+                    return instruction, input_text, output
+
+            return "", "", ""
+
         tokenizer_exists = self.tokenizer_path.exists()
         
         if not force_retrain and tokenizer_exists:
@@ -103,12 +142,16 @@ class TokenizerManager:
             # 收集文本
             all_texts = []
             for item in tqdm(training_data, desc="收集文本"):
-                prompt = str(item.get("prompt", "")).strip()
-                completion = str(item.get("completion", "")).strip()
-                if prompt:
-                    all_texts.append(prompt)
-                if completion:
-                    all_texts.append(completion)
+                if not isinstance(item, dict):
+                    continue
+
+                instruction, input_text, output = _extract_supervised_fields(item)
+                if not instruction or not output:
+                    continue
+
+                instruction_with_input = f"{instruction}\n{input_text}".strip() if input_text else instruction
+                all_texts.append(instruction_with_input)
+                all_texts.append(output)
             
             if not all_texts:
                 raise ValueError("沒有收集到用於訓練分詞器的文本")
@@ -118,7 +161,11 @@ class TokenizerManager:
                 for text in all_texts:
                     yield text
             
-            self.create_and_train_tokenizer(text_iterator(), target_vocab_size)
+            self.create_and_train_tokenizer(
+                text_iterator(),
+                target_vocab_size,
+                min_frequency=min_frequency,
+            )
         
         if self.transformers_tokenizer is None:
             raise RuntimeError("分詞器初始化失敗")

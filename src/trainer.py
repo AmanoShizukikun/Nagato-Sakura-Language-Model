@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import warnings
+import math
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from functools import partial
@@ -23,9 +24,10 @@ import wandb
 from tqdm import tqdm
 
 from .nagato_sakura_model import NagatoSakuraForCausalLM, NSConfig
-from .logger import setup_logging, SystemMonitor
+from .logger import setup_logging, SystemMonitor, CSVMetricsWriter
 from .tokenizer import TokenizerManager
 from .data_utils import smart_collate_fn, EarlyStoppingCallback
+from .checkpoint_manager import CheckpointPolicy, CheckpointManager
 
 # 混合精度處理
 try:
@@ -63,6 +65,7 @@ class AdvancedNagatoSakuraTrainer:
         # 系統監控
         self.system_monitor = SystemMonitor()
         self.system_monitor.log_system_status(self.logger)
+        self.metrics_writer = CSVMetricsWriter(str(self.output_dir))
         
         # 模型相關
         self.model_config = model_config
@@ -74,6 +77,14 @@ class AdvancedNagatoSakuraTrainer:
         self.current_epoch = 0
         self.best_eval_loss = float('inf')
         self.training_history = defaultdict(list)
+        self.loss_ema: Optional[float] = None
+        self.best_checkpoint_path: Optional[Path] = None
+        self.checkpoint_manager: Optional[CheckpointManager] = None
+        self.eval_short_max_tokens = 64
+        self.eval_medium_max_tokens = 256
+        best_model_dir = self.output_dir / "best_model"
+        if (best_model_dir / "model.pt").exists():
+            self.best_checkpoint_path = best_model_dir
         
         # WandB集成
         self.use_wandb = use_wandb
@@ -110,18 +121,43 @@ class AdvancedNagatoSakuraTrainer:
         # 創建模型
         try:
             self.model = NagatoSakuraForCausalLM(self.model_config).to(self.device)
-            
-            # 計算參數數量
-            total_params = sum(p.numel() for p in self.model.parameters())
-            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            
-            self.logger.info(f"模型初始化完成:")
-            self.logger.info(f"  總參數量: {total_params/1e6:.2f}M")
-            self.logger.info(f"  可訓練參數: {trainable_params/1e6:.2f}M")
-            self.logger.info(f"  模型大小: {total_params * 4 / 1024**3:.2f}GB (FP32)")
-            
-            # 綁定權重
-            self.model.tie_weights()
+
+            param_stats = self.model.get_parameter_stats()
+            total_params = param_stats["total_params"]
+            trainable_params = param_stats["trainable_params"]
+            embedding_params = param_stats["embedding_params"]
+            non_embedding_params = param_stats["non_embedding_params"]
+
+            self.logger.info("模型初始化完成")
+            self.logger.info(f"模型參數量: {total_params/1e6:.2f}M")
+            self.logger.info(
+                f"參數組成: Embedding {embedding_params/1e6:.2f}M "
+                f"+ 非Embedding {non_embedding_params/1e6:.2f}M"
+            )
+
+            tokenizer_path = self.tokenizer_manager.tokenizer_path
+            if tokenizer_path.exists():
+                tokenizer_size_bytes = tokenizer_path.stat().st_size
+                tokenizer_size_mb = tokenizer_size_bytes / (1024 ** 2)
+                tokenizer_ratio = (tokenizer_size_bytes / max(1, param_stats["parameter_memory_bytes"])) * 100.0
+                self.logger.info(
+                    f"Tokenizer檔案: {tokenizer_size_mb:.2f}MB "
+                    f"(約 {tokenizer_ratio:.2f}% 參數記憶體)"
+                )
+            else:
+                self.logger.info("Tokenizer檔案: 未找到（不影響模型參數統計）")
+
+            # 詳細拆分放在 DEBUG，避免預設輸出過於冗長。
+            self.logger.debug(f"可訓練參數: {trainable_params/1e6:.2f}M")
+            self.logger.debug(
+                f"Embedding矩陣: {param_stats['vocab_size']} x {param_stats['hidden_size']}"
+            )
+            if param_stats["lm_head_tied_with_embedding"]:
+                self.logger.debug("LM Head參數: 0 (與Embedding共享權重)")
+            else:
+                self.logger.debug(f"LM Head參數: {param_stats['lm_head_params']/1e6:.2f}M")
+            self.logger.debug(f"非Embedding參數: {non_embedding_params/1e6:.2f}M")
+            self.logger.debug(f"參數記憶體估算(目前dtype): {param_stats['parameter_memory_gb']:.2f}GB")
 
             if getattr(self.model_config, "gradient_checkpointing", False):
                 self.model.model.enable_gradient_checkpointing()
@@ -131,58 +167,237 @@ class AdvancedNagatoSakuraTrainer:
                 wandb.config.update({
                     "total_params": total_params,
                     "trainable_params": trainable_params,
-                    "model_size_gb": total_params * 4 / 1024**3
+                    "embedding_params": embedding_params,
+                    "non_embedding_params": non_embedding_params,
+                    "model_size_gb": param_stats["parameter_memory_gb"],
                 })
                 
         except Exception as e:
             self.logger.error(f"模型初始化失敗: {e}")
             raise
 
-    def prepare_data_and_tokenizer(self, training_data_file: str, target_vocab_size: int,
-                                 force_retrain_tokenizer: bool = False) -> List[Dict[str, str]]:
-        """準備數據和分詞器"""
-        
-        # 加載數據
-        self.logger.info(f"從 {training_data_file} 加載訓練數據...")
-        try:
-            with open(training_data_file, 'r', encoding='utf-8') as f:
-                loaded_data = json.load(f)
-            
-            if not isinstance(loaded_data, list):
-                raise ValueError("數據格式錯誤")
-            
-            # 驗證數據格式
-            valid_data = []
-            for i, item in enumerate(loaded_data):
-                if isinstance(item, dict) and "prompt" in item and "completion" in item:
-                    if item["prompt"] and item["completion"]:
-                        valid_data.append(item)
-                    else:
-                        self.logger.warning(f"跳過空數據項 {i}")
-                else:
-                    self.logger.warning(f"跳過格式錯誤的數據項 {i}")
-            
-            self.logger.info(f"成功加載 {len(valid_data)} 條有效數據")
-            
-        except Exception as e:
-            self.logger.error(f"數據加載失敗: {e}")
-            raise
-        
-        # 處理分詞器
-        self.tokenizer_manager.prepare_tokenizer(
-            valid_data, target_vocab_size, force_retrain_tokenizer
+    @staticmethod
+    def _clean_optional_text(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        text = value.strip()
+        if text.lower() in {"", "none", "null", "n/a", "nan"}:
+            return ""
+        return text
+
+    @classmethod
+    def _normalize_supervised_item(cls, item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        if not isinstance(item, dict):
+            return None
+
+        candidates = [
+            (item.get("instruction"), item.get("input"), item.get("output")),
+            (item.get("zh_instruction"), item.get("zh_input"), item.get("zh_output")),
+            (item.get("en_instruction"), item.get("en_input"), item.get("en_output")),
+            (item.get("prompt"), "", item.get("completion")),
+        ]
+
+        for instruction_raw, input_raw, output_raw in candidates:
+            if not isinstance(instruction_raw, str) or not isinstance(output_raw, str):
+                continue
+
+            instruction = cls._clean_optional_text(instruction_raw)
+            output = output_raw.strip()
+            input_text = cls._clean_optional_text(input_raw)
+
+            if not instruction or not output:
+                continue
+
+            return {
+                "instruction": instruction,
+                "input": input_text,
+                "output": output,
+            }
+
+        return None
+
+    @classmethod
+    def _sample_signature(cls, item: Dict[str, Any]) -> Tuple[str, str]:
+        """將樣本轉為可比較的唯一鍵。"""
+        normalized = cls._normalize_supervised_item(item)
+        if not normalized:
+            return "", ""
+
+        instruction = normalized["instruction"]
+        input_text = normalized["input"]
+        output = normalized["output"]
+        prompt_text = f"{instruction} {input_text}".strip() if input_text else instruction
+        return prompt_text, output
+
+    @staticmethod
+    def _load_entries_from_jsonl(file_path: Path) -> List[Any]:
+        rows: List[Any] = []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_no, line in enumerate(f, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    rows.append(json.loads(raw))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{file_path} 第 {line_no} 行 JSONL 解析失敗: {e}") from e
+        return rows
+
+    @classmethod
+    def _load_entries_from_file(cls, file_path: Path) -> List[Any]:
+        suffix = file_path.suffix.lower()
+        if suffix == ".jsonl":
+            return cls._load_entries_from_jsonl(file_path)
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+
+        if isinstance(loaded, list):
+            return loaded
+        if isinstance(loaded, dict):
+            return [loaded]
+        raise ValueError(f"{file_path} 格式錯誤：預期為 list/dict")
+
+    def _load_supervised_data_file(self, data_file: str, dataset_name: str) -> List[Dict[str, str]]:
+        """加載並驗證 instruction/input/output 監督數據（支援檔案或資料夾）。"""
+        data_path = Path(data_file)
+        if not data_path.exists():
+            raise FileNotFoundError(f"{dataset_name}來源不存在: {data_file}")
+
+        source_files: List[Path] = []
+        if data_path.is_dir():
+            for pattern in ("*.json", "*.jsonl"):
+                source_files.extend(data_path.rglob(pattern))
+
+            unique_files: Dict[str, Path] = {}
+            for path in source_files:
+                unique_files[str(path.resolve())] = path
+            source_files = [unique_files[k] for k in sorted(unique_files.keys())]
+
+            if not source_files:
+                raise ValueError(f"{dataset_name}資料夾沒有可用的 json/jsonl 文件: {data_file}")
+        else:
+            source_files = [data_path]
+
+        valid_data: List[Dict[str, str]] = []
+        invalid_count = 0
+        failed_files: List[str] = []
+
+        for source_file in source_files:
+            try:
+                loaded_data = self._load_entries_from_file(source_file)
+            except Exception as e:
+                failed_files.append(f"{source_file}: {e}")
+                continue
+
+            for item in loaded_data:
+                normalized_item = self._normalize_supervised_item(item)
+                if not normalized_item:
+                    invalid_count += 1
+                    continue
+                valid_data.append(normalized_item)
+
+        if failed_files:
+            self.logger.warning(
+                f"{dataset_name}有 {len(failed_files)} 個文件讀取失敗，將略過:\n" + "\n".join(failed_files[:10])
+            )
+            if len(failed_files) > 10:
+                self.logger.warning(f"另有 {len(failed_files) - 10} 個失敗文件未列出")
+
+        if not valid_data:
+            raise ValueError(f"{dataset_name}沒有有效樣本: {data_file}")
+
+        self.logger.info(
+            f"{dataset_name}載入完成 - 來源檔案: {len(source_files)}, 有效: {len(valid_data)}, 格式錯誤: {invalid_count}"
         )
-        
         return valid_data
 
-    def create_datasets(self, data_list: List[Dict[str, str]], 
-                       eval_split_ratio: float = 0.01) -> Tuple[Dataset, Optional[Dataset]]:
+    def _count_overlapping_samples(
+        self,
+        train_data: List[Dict[str, str]],
+        eval_data: List[Dict[str, str]],
+    ) -> int:
+        """統計 train/eval 重疊樣本數（不做剔除）。"""
+        eval_signatures = {self._sample_signature(item) for item in eval_data}
+        overlap_count = 0
+        for item in train_data:
+            if self._sample_signature(item) in eval_signatures:
+                overlap_count += 1
+        return overlap_count
+
+    def prepare_data_and_tokenizer(
+        self,
+        training_data_file: str,
+        target_vocab_size: int,
+        force_retrain_tokenizer: bool = False,
+        tokenizer_min_frequency: int = 2,
+        eval_data_file: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, str]], Optional[List[Dict[str, str]]]]:
+        """準備訓練/評估數據並訓練分詞器。"""
+
+        self.logger.info(f"從 {training_data_file} 加載訓練數據...")
+        train_data = self._load_supervised_data_file(training_data_file, "訓練數據")
+        fixed_eval_data: Optional[List[Dict[str, str]]] = None
+
+        if eval_data_file:
+            self.logger.info(f"從 {eval_data_file} 加載固定評估集...")
+            fixed_eval_data = self._load_supervised_data_file(eval_data_file, "固定評估集")
+            overlap_count = self._count_overlapping_samples(train_data, fixed_eval_data)
+
+            self.logger.info(
+                f"固定評估集模式 - 訓練集保留: {len(train_data)}, "
+                f"評估集: {len(fixed_eval_data)}, 與訓練集重疊: {overlap_count}"
+            )
+            self.metrics_writer.log_event({
+                "epoch": 0,
+                "global_step": self.global_step,
+                "event_type": "fixed_eval_dataset",
+                "severity": "INFO",
+                "message": "fixed eval dataset enabled and overlap intentionally kept",
+                "value": json.dumps({
+                    "train_before": len(train_data),
+                    "train_after": len(train_data),
+                    "eval_size": len(fixed_eval_data),
+                    "overlap_count": overlap_count,
+                    "overlap_removed": False,
+                }, ensure_ascii=False),
+            })
+
+        # 分詞器使用完整訓練集，固定評估集可與訓練集重疊用於擬合監控。
+        self.tokenizer_manager.prepare_tokenizer(
+            train_data,
+            target_vocab_size,
+            force_retrain_tokenizer,
+            min_frequency=tokenizer_min_frequency,
+        )
+
+        return train_data, fixed_eval_data
+
+    def create_datasets(
+        self,
+        data_list: List[Dict[str, str]],
+        eval_split_ratio: float = 0.01,
+        fixed_eval_data: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[Dataset, Optional[Dataset]]:
         """創建訓練和評估數據集"""
         
         self.logger.info(f"創建數據集，總數據量: {len(data_list)}")
         
         if not data_list:
             raise ValueError("數據列表為空")
+
+        if fixed_eval_data is not None:
+            if not fixed_eval_data:
+                raise ValueError("固定評估集為空，請檢查 eval_data_file")
+            if eval_split_ratio > 0:
+                self.logger.warning("已提供固定評估集，將忽略 eval_split_ratio")
+
+            train_dataset = Dataset.from_list(data_list)
+            eval_dataset = Dataset.from_list(fixed_eval_data)
+            self.logger.info(
+                f"使用固定評估集 - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
+            )
+            return train_dataset, eval_dataset
         
         # 創建完整數據集
         dataset = Dataset.from_list(data_list)
@@ -203,10 +418,18 @@ class AdvancedNagatoSakuraTrainer:
             self.logger.info(f"使用完整數據集進行訓練: {len(dataset)}")
             return dataset, None
 
-    def setup_training_components(self, train_dataset: Dataset, batch_size: int,
-                                num_epochs: int, learning_rate: float,
-                                weight_decay: float, gradient_accumulation_steps: int,
-                                warmup_ratio: float, lr_scheduler_type: str):
+    def setup_training_components(
+        self,
+        train_dataset: Dataset,
+        batch_size: int,
+        num_epochs: int,
+        learning_rate: float,
+        weight_decay: float,
+        gradient_accumulation_steps: int,
+        warmup_ratio: float,
+        lr_scheduler_type: str,
+        scheduler_target_epochs: Optional[int] = None,
+    ):
         """設置訓練組件"""
         
         # 數據加載器
@@ -255,8 +478,9 @@ class AdvancedNagatoSakuraTrainer:
         )
         
         # 學習率調度器
-        total_steps = len(train_dataloader) // gradient_accumulation_steps * num_epochs
-        warmup_steps = int(total_steps * warmup_ratio)
+        effective_epochs = max(1, int(scheduler_target_epochs or num_epochs))
+        total_steps = max(1, len(train_dataloader) // max(1, gradient_accumulation_steps) * effective_epochs)
+        warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0 else 0
         
         if lr_scheduler_type == "cosine":
             scheduler = get_cosine_schedule_with_warmup(
@@ -288,44 +512,61 @@ class AdvancedNagatoSakuraTrainer:
         self.logger.info(f"  有效批次大小: {batch_size * gradient_accumulation_steps}")
         self.logger.info(f"  總訓練步數: {total_steps}")
         self.logger.info(f"  預熱步數: {warmup_steps}")
+        self.logger.info(f"  調度器目標Epoch: {effective_epochs}")
         self.logger.info(f"  學習率調度器: {lr_scheduler_type}")
         self.logger.info(f"  混合精度: {'啟用' if scaler.is_enabled() else '禁用'}")
         
         return train_dataloader, optimizer, scheduler, scaler
 
-    def train_epoch(self, train_dataloader: DataLoader, optimizer, scheduler, 
-                scaler: GradScaler, gradient_accumulation_steps: int,
-                max_grad_norm: float, log_steps_per_epoch: int = 10) -> float:
-        """訓練一個epoch"""
-        
+    def train_epoch(
+        self,
+        train_dataloader: DataLoader,
+        optimizer,
+        scheduler,
+        scaler: GradScaler,
+        gradient_accumulation_steps: int,
+        max_grad_norm: float,
+        log_steps_per_epoch: int = 10,
+        metrics_log_interval_steps: int = 50,
+    ) -> Dict[str, Any]:
+        """訓練一個epoch並回傳統計資訊"""
+
         self.model.train()
         epoch_loss = 0.0
         num_batches = 0
         accumulated_steps = 0
         invalid_batches = 0
-        
-        # 計算日誌記錄間隔（將epoch分為log_steps_per_epoch個部分）
+        invalid_loss_count = 0
+        invalid_grad_count = 0
+        skipped_update_count = 0
+        epoch_tokens = 0
+        accumulated_tokens = 0
+        optimizer_updates = 0
+
+        epoch_start_time = time.time()
+
         total_steps = len(train_dataloader)
-        log_interval_steps = max(1, total_steps // log_steps_per_epoch)
-        
+        log_interval_steps = max(1, total_steps // max(1, log_steps_per_epoch))
+        metrics_log_interval_steps = max(1, metrics_log_interval_steps)
+
         progress_bar = tqdm(
-            train_dataloader, 
+            train_dataloader,
             desc=f"Epoch {self.current_epoch + 1}",
             leave=False
         )
-        
+
         for step, batch in enumerate(progress_bar):
-            # 跳過無效批次
             if batch["input_ids"] is None:
                 invalid_batches += 1
                 continue
-            
-            # 移動到設備
+
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
-            
-            # 前向傳播
+            batch_tokens = int((labels != -100).sum().item())
+            epoch_tokens += batch_tokens
+            accumulated_tokens += batch_tokens
+
             with autocast(enabled=scaler.is_enabled()):
                 outputs = self.model(
                     input_ids=input_ids,
@@ -334,128 +575,243 @@ class AdvancedNagatoSakuraTrainer:
                     use_cache=False,
                 )
                 loss = outputs.loss
-            
+
             if loss is None or torch.isnan(loss) or torch.isinf(loss):
+                invalid_loss_count += 1
                 self.logger.warning(f"檢測到無效損失，跳過此批次: {loss}")
+                self.metrics_writer.log_event({
+                    "epoch": self.current_epoch + 1,
+                    "global_step": self.global_step,
+                    "event_type": "invalid_loss",
+                    "severity": "WARNING",
+                    "message": "loss is nan/inf or missing",
+                    "value": str(loss),
+                })
                 accumulated_steps = 0
+                accumulated_tokens = 0
+                skipped_update_count += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
-            
-            # 反向傳播
+
             loss = loss / gradient_accumulation_steps
             scaler.scale(loss).backward()
-            
+
             loss_val = loss.item() * gradient_accumulation_steps
             epoch_loss += loss_val
             num_batches += 1
             accumulated_steps += 1
-            
-            # 立即釋放計算圖記憶體
+
             del outputs, loss
-            
-            # 梯度更新
+
             if accumulated_steps >= gradient_accumulation_steps:
-                # 梯度裁剪
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
+                    self.model.parameters(),
                     max_grad_norm
                 )
-                
-                # 檢查梯度
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                grad_norm_value = float(grad_norm)
+
+                if not math.isfinite(grad_norm_value):
+                    invalid_grad_count += 1
                     self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
+                    self.metrics_writer.log_event({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "event_type": "invalid_grad_norm",
+                        "severity": "WARNING",
+                        "message": "grad norm is nan/inf",
+                        "value": str(grad_norm),
+                    })
                     accumulated_steps = 0
+                    accumulated_tokens = 0
+                    skipped_update_count += 1
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
                     continue
-                
-                # 優化器步驟
+
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                
+
                 accumulated_steps = 0
                 self.global_step += 1
-                
-                # 更新進度條
+                optimizer_updates += 1
+
                 current_lr = scheduler.get_last_lr()[0]
+                avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+
+                if self.loss_ema is None:
+                    self.loss_ema = loss_val
+                else:
+                    self.loss_ema = 0.98 * self.loss_ema + 0.02 * loss_val
+
                 progress_bar.set_postfix({
                     "Loss": f"{loss_val:.4f}",
                     "LR": f"{current_lr:.2e}",
                     "Step": self.global_step
                 })
-                
-                # 記錄日誌
+
                 if self.global_step % log_interval_steps == 0:
-                    avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
                     self.logger.info(
                         f"Step {self.global_step}: Loss={avg_loss:.4f}, "
-                        f"LR={current_lr:.2e}, GradNorm={grad_norm:.4f}"
+                        f"LR={current_lr:.2e}, GradNorm={grad_norm_value:.4f}"
                     )
-                    
-                    # WandB記錄
+
                     if self.use_wandb:
                         wandb.log({
                             "train/loss": avg_loss,
+                            "train/loss_ema": self.loss_ema,
                             "train/learning_rate": current_lr,
-                            "train/grad_norm": grad_norm,
-                            "global_step": self.global_step
+                            "train/grad_norm": grad_norm_value,
+                            "global_step": self.global_step,
                         })
-                
-                # 系統監控
+
+                if self.global_step % metrics_log_interval_steps == 0:
+                    elapsed = max(1e-6, time.time() - epoch_start_time)
+                    tokens_per_sec = epoch_tokens / elapsed
+                    gpu_memory_mb = 0.0
+                    if self.device.type == "cuda":
+                        gpu_memory_mb = torch.cuda.memory_allocated() / 1024**2
+
+                    system_info = self.system_monitor.get_system_info()
+                    self.metrics_writer.log_step_metrics({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "batch_idx": step,
+                        "train_loss": avg_loss,
+                        "loss_ema": self.loss_ema,
+                        "learning_rate": current_lr,
+                        "grad_norm": grad_norm_value,
+                        "batch_tokens": accumulated_tokens,
+                        "tokens_per_sec": tokens_per_sec,
+                        "invalid_batches": invalid_batches,
+                        "gpu_memory_mb": gpu_memory_mb,
+                        "gpu_memory_percent": system_info.get("gpu_memory_percent", ""),
+                        "cpu_percent": system_info.get("cpu_percent", ""),
+                        "ram_percent": system_info.get("memory_percent", ""),
+                    })
+                    accumulated_tokens = 0
+
                 if self.global_step % (log_interval_steps * 5) == 0:
                     self.system_monitor.log_system_status(self.logger)
-        
-        # 處理剩餘的累積梯度
+
         if accumulated_steps > 0:
             try:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
+                    self.model.parameters(),
                     max_grad_norm
                 )
-                
-                if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                grad_norm_value = float(grad_norm)
+
+                if math.isfinite(grad_norm_value):
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
                     self.global_step += 1
+                    optimizer_updates += 1
                 else:
+                    invalid_grad_count += 1
+                    skipped_update_count += 1
                     scaler.update()
-                
+
                 optimizer.zero_grad(set_to_none=True)
             except RuntimeError as e:
                 self.logger.warning(f"處理剩餘梯度時出錯: {e}")
+                skipped_update_count += 1
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
-        
+
         if num_batches == 0:
             raise RuntimeError(
                 "本 epoch 沒有任何有效批次，訓練已停止。請檢查分詞器編碼、數據格式與 collate_fn。"
             )
 
         total_seen_batches = num_batches + invalid_batches
+        invalid_ratio = 0.0
         if total_seen_batches > 0:
             invalid_ratio = invalid_batches / total_seen_batches
             if invalid_ratio > 0.3:
                 self.logger.warning(
                     f"偵測到較高無效批次比例: {invalid_ratio:.1%} ({invalid_batches}/{total_seen_batches})"
                 )
+                self.metrics_writer.log_event({
+                    "epoch": self.current_epoch + 1,
+                    "global_step": self.global_step,
+                    "event_type": "high_invalid_batch_ratio",
+                    "severity": "WARNING",
+                    "message": "invalid batch ratio exceeded 30%",
+                    "value": invalid_ratio,
+                })
 
         avg_epoch_loss = epoch_loss / num_batches
-        return avg_epoch_loss
+        return {
+            "avg_loss": avg_epoch_loss,
+            "num_batches": num_batches,
+            "invalid_batches": invalid_batches,
+            "invalid_ratio": invalid_ratio,
+            "invalid_loss_count": invalid_loss_count,
+            "invalid_grad_count": invalid_grad_count,
+            "skipped_update_count": skipped_update_count,
+            "optimizer_updates": optimizer_updates,
+            "tokens_seen": epoch_tokens,
+        }
 
-    def evaluate(self, eval_dataloader: DataLoader) -> Dict[str, float]:
+    @staticmethod
+    def _get_length_bucket(token_count: int, short_max: int = 64, medium_max: int = 256) -> str:
+        if token_count <= short_max:
+            return "short"
+        if token_count <= medium_max:
+            return "medium"
+        return "long"
+
+    @staticmethod
+    def _finalize_bucket_metrics(raw_bucket_stats: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, Any]]:
+        bucket_metrics: Dict[str, Dict[str, Any]] = {}
+        for name, stats in raw_bucket_stats.items():
+            tokens = int(stats["tokens"])
+            samples = int(stats["samples"])
+            if tokens > 0:
+                loss = float(stats["loss_sum"] / tokens)
+                perplexity = float(math.exp(min(20.0, loss)))
+            else:
+                loss = None
+                perplexity = None
+            bucket_metrics[name] = {
+                "samples": samples,
+                "tokens": tokens,
+                "loss": loss,
+                "perplexity": perplexity,
+            }
+        return bucket_metrics
+
+    @staticmethod
+    def _flatten_bucket_metrics(bucket_metrics: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        flattened: Dict[str, Any] = {}
+        for bucket_name in ("short", "medium", "long"):
+            item = bucket_metrics.get(bucket_name, {})
+            flattened[f"{bucket_name}_samples"] = item.get("samples", 0)
+            flattened[f"{bucket_name}_tokens"] = item.get("tokens", 0)
+            flattened[f"{bucket_name}_loss"] = item.get("loss", "")
+            flattened[f"{bucket_name}_perplexity"] = item.get("perplexity", "")
+        return flattened
+
+    def evaluate(self, eval_dataloader: DataLoader) -> Dict[str, Any]:
         """評估模型"""
         if eval_dataloader is None:
             return {}
         
         self.model.eval()
-        total_loss = 0.0
+        eval_start_time = time.time()
+        total_nll_sum = 0.0
         total_tokens = 0
         num_batches = 0
+        bucket_raw = {
+            "short": {"loss_sum": 0.0, "tokens": 0, "samples": 0},
+            "medium": {"loss_sum": 0.0, "tokens": 0, "samples": 0},
+            "long": {"loss_sum": 0.0, "tokens": 0, "samples": 0},
+        }
         
         with torch.no_grad():
             for batch in tqdm(eval_dataloader, desc="評估中", leave=False):
@@ -473,31 +829,110 @@ class AdvancedNagatoSakuraTrainer:
                         labels=labels,
                         use_cache=False,
                     )
-                    loss = outputs.loss
-                
-                if loss is not None and not (torch.isnan(loss) or torch.isinf(loss)):
-                    total_loss += loss.item()
-                    valid_tokens = (labels != -100).sum().item()
-                    total_tokens += valid_tokens
-                    num_batches += 1
+                logits = outputs.logits
+
+                if logits is None:
+                    del outputs
+                    continue
+
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+                if shift_logits.numel() == 0 or shift_labels.numel() == 0:
+                    del outputs, logits, shift_logits, shift_labels
+                    continue
+
+                token_losses = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).view_as(shift_labels)
+                valid_mask = shift_labels != -100
+
+                if not valid_mask.any():
+                    del outputs, logits, shift_logits, shift_labels, token_losses, valid_mask
+                    continue
+
+                valid_token_losses = token_losses[valid_mask]
+                if torch.isnan(valid_token_losses).any() or torch.isinf(valid_token_losses).any():
+                    self.metrics_writer.log_event({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "event_type": "invalid_eval_token_loss",
+                        "severity": "WARNING",
+                        "message": "eval token loss has nan/inf",
+                        "value": "",
+                    })
+                    del outputs, logits, shift_logits, shift_labels, token_losses, valid_mask, valid_token_losses
+                    continue
+
+                batch_loss_sum = float(valid_token_losses.sum().item())
+                batch_tokens = int(valid_mask.sum().item())
+
+                total_nll_sum += batch_loss_sum
+                total_tokens += batch_tokens
+                num_batches += 1
+
+                sample_token_counts = valid_mask.sum(dim=1)
+                sample_loss_sums = (token_losses * valid_mask).sum(dim=1)
+                for idx in range(sample_token_counts.shape[0]):
+                    sample_tokens = int(sample_token_counts[idx].item())
+                    if sample_tokens <= 0:
+                        continue
+                    sample_loss_sum = float(sample_loss_sums[idx].item())
+                    bucket_name = self._get_length_bucket(
+                        sample_tokens,
+                        short_max=self.eval_short_max_tokens,
+                        medium_max=self.eval_medium_max_tokens,
+                    )
+                    bucket_raw[bucket_name]["loss_sum"] += sample_loss_sum
+                    bucket_raw[bucket_name]["tokens"] += sample_tokens
+                    bucket_raw[bucket_name]["samples"] += 1
                 
                 # 釋放評估時的計算圖與張量
-                del outputs, loss
+                del outputs, logits, shift_logits, shift_labels, token_losses, valid_mask, valid_token_losses
         
-        if num_batches == 0:
-            return {"eval_loss": float('inf'), "perplexity": float('inf')}
+        bucket_metrics = self._finalize_bucket_metrics(bucket_raw)
+
+        if num_batches == 0 or total_tokens == 0:
+            return {
+                "eval_loss": float('inf'),
+                "perplexity": float('inf'),
+                "total_tokens": 0,
+                "eval_time_sec": time.time() - eval_start_time,
+                "bucket_metrics": bucket_metrics,
+                "bucket_boundaries": {
+                    "short_max_tokens": self.eval_short_max_tokens,
+                    "medium_max_tokens": self.eval_medium_max_tokens,
+                },
+            }
         
-        avg_loss = total_loss / num_batches
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        avg_loss = total_nll_sum / total_tokens
+        perplexity = float(math.exp(min(20.0, avg_loss)))
         
         return {
             "eval_loss": avg_loss,
             "perplexity": perplexity,
-            "total_tokens": total_tokens
+            "total_tokens": total_tokens,
+            "eval_time_sec": time.time() - eval_start_time,
+            "bucket_metrics": bucket_metrics,
+            "bucket_boundaries": {
+                "short_max_tokens": self.eval_short_max_tokens,
+                "medium_max_tokens": self.eval_medium_max_tokens,
+            },
         }
 
-    def save_checkpoint(self, checkpoint_name: str, optimizer, scheduler, 
-                       scaler: Optional[GradScaler] = None, is_best: bool = False):
+    def save_checkpoint(
+        self,
+        checkpoint_name: str,
+        optimizer,
+        scheduler,
+        scaler: Optional[GradScaler] = None,
+        is_best: bool = False,
+        checkpoint_reasons: Optional[List[str]] = None,
+        eval_loss: Optional[float] = None,
+    ) -> Optional[Path]:
         """保存檢查點"""
         checkpoint_dir = self.output_dir / checkpoint_name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -537,11 +972,23 @@ class AdvancedNagatoSakuraTrainer:
                     shutil.rmtree(best_model_dir)
                 import shutil
                 shutil.copytree(checkpoint_dir, best_model_dir)
+                self.best_checkpoint_path = checkpoint_dir
             
             self.logger.info(f"檢查點已保存: {checkpoint_dir}")
+            self.metrics_writer.log_checkpoint_metrics({
+                "epoch": self.current_epoch + 1,
+                "global_step": self.global_step,
+                "checkpoint_name": checkpoint_name,
+                "checkpoint_path": str(checkpoint_dir),
+                "eval_loss": eval_loss,
+                "is_best": is_best,
+                "reasons": "|".join(checkpoint_reasons or []),
+            })
+            return checkpoint_dir
             
         except Exception as e:
             self.logger.error(f"保存檢查點失敗: {e}")
+            return None
 
     def load_checkpoint(self, checkpoint_dir: str, optimizer, scheduler, 
                        scaler: Optional[GradScaler] = None) -> bool:
@@ -571,6 +1018,7 @@ class AdvancedNagatoSakuraTrainer:
             model_path = checkpoint_path / "model.pt"
             if model_path.exists():
                 self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                self.best_checkpoint_path = checkpoint_path
             
             self.logger.info(f"檢查點加載成功: {checkpoint_dir}")
             self.logger.info(f"恢復至 Epoch {self.current_epoch}, Step {self.global_step}")
@@ -578,6 +1026,29 @@ class AdvancedNagatoSakuraTrainer:
             
         except Exception as e:
             self.logger.error(f"加載檢查點失敗: {e}")
+            return False
+
+    def _load_best_model_weights(self) -> bool:
+        """回滾到最佳模型權重"""
+        best_model_dir = self.output_dir / "best_model"
+        best_model_path = best_model_dir / "model.pt"
+
+        target_path = None
+        if best_model_path.exists():
+            target_path = best_model_path
+        elif self.best_checkpoint_path is not None:
+            candidate = self.best_checkpoint_path / "model.pt"
+            if candidate.exists():
+                target_path = candidate
+
+        if target_path is None:
+            return False
+
+        try:
+            self.model.load_state_dict(torch.load(target_path, map_location=self.device))
+            return True
+        except Exception as e:
+            self.logger.warning(f"回滾最佳模型失敗: {e}")
             return False
 
     def find_latest_checkpoint(self) -> Optional[str]:
@@ -592,32 +1063,184 @@ class AdvancedNagatoSakuraTrainer:
         latest_checkpoint = max(checkpoints, key=lambda x: x.stat().st_mtime)
         return str(latest_checkpoint)
 
-    def train(self, train_dataset: Dataset, eval_dataset: Optional[Dataset] = None,
-              batch_size: int = 4, num_epochs: int = 3, learning_rate: float = 5e-5,
-              gradient_accumulation_steps: int = 1, weight_decay: float = 0.01,
-              lr_scheduler_type: str = "cosine", warmup_ratio: float = 0.03,
-              max_grad_norm: float = 1.0, log_interval: int = 1,
-              save_interval_epochs: int = 2,
-              early_stopping_patience: int = 5, resume_from_checkpoint: bool = True):
+    def _export_training_summary(
+        self,
+        run_status: str,
+        epochs_planned: int,
+        epochs_completed: int,
+        run_start_time: float,
+        run_aggregates: Dict[str, Any],
+        eval_history: List[Dict[str, Any]],
+        final_eval_metrics: Optional[Dict[str, Any]],
+        checkpoint_overview: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        metrics_dir = self.output_dir / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        run_time_sec = float(time.time() - run_start_time)
+
+        finite_eval_records = [
+            r for r in eval_history
+            if r.get("eval_loss") is not None and math.isfinite(float(r.get("eval_loss")))
+        ]
+        best_record = min(finite_eval_records, key=lambda x: float(x["eval_loss"])) if finite_eval_records else None
+
+        best_bucket_metrics = (best_record or {}).get("bucket_metrics", {})
+        best_bucket_flat = self._flatten_bucket_metrics(best_bucket_metrics)
+
+        final_eval_loss = None
+        final_perplexity = None
+        if final_eval_metrics:
+            final_eval_loss = final_eval_metrics.get("eval_loss")
+            final_perplexity = final_eval_metrics.get("perplexity")
+        elif eval_history:
+            final_eval_loss = eval_history[-1].get("eval_loss")
+            final_perplexity = eval_history[-1].get("perplexity")
+
+        summary = {
+            "run_status": run_status,
+            "epochs_planned": int(epochs_planned),
+            "epochs_completed": int(epochs_completed),
+            "global_step": int(self.global_step),
+            "best_eval_loss": best_record.get("eval_loss") if best_record else None,
+            "best_eval_epoch": best_record.get("epoch") if best_record else None,
+            "final_eval_loss": final_eval_loss,
+            "final_perplexity": final_perplexity,
+            "total_tokens_seen": int(run_aggregates.get("tokens_seen", 0)),
+            "invalid_loss_count": int(run_aggregates.get("invalid_loss_count", 0)),
+            "invalid_grad_count": int(run_aggregates.get("invalid_grad_count", 0)),
+            "skipped_update_count": int(run_aggregates.get("skipped_update_count", 0)),
+            "run_time_sec": round(run_time_sec, 3),
+            "best_checkpoint_path": (checkpoint_overview or {}).get("best_checkpoint_path", ""),
+            "latest_checkpoint_path": (checkpoint_overview or {}).get("latest_checkpoint_path", ""),
+            "best_bucket_metrics": best_bucket_metrics,
+            "bucket_boundaries": {
+                "short_max_tokens": self.eval_short_max_tokens,
+                "medium_max_tokens": self.eval_medium_max_tokens,
+            },
+            "checkpoint_overview": checkpoint_overview or {},
+            "eval_history": eval_history,
+        }
+
+        now_tag = time.strftime("%Y%m%d_%H%M%S")
+        latest_json = metrics_dir / "training_summary_latest.json"
+        timed_json = metrics_dir / f"training_summary_{now_tag}.json"
+
+        with open(latest_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        with open(timed_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        csv_row = {
+            "run_status": summary["run_status"],
+            "epochs_planned": summary["epochs_planned"],
+            "epochs_completed": summary["epochs_completed"],
+            "global_step": summary["global_step"],
+            "best_eval_loss": summary["best_eval_loss"],
+            "best_eval_epoch": summary["best_eval_epoch"],
+            "final_eval_loss": summary["final_eval_loss"],
+            "final_perplexity": summary["final_perplexity"],
+            "total_tokens_seen": summary["total_tokens_seen"],
+            "invalid_loss_count": summary["invalid_loss_count"],
+            "invalid_grad_count": summary["invalid_grad_count"],
+            "skipped_update_count": summary["skipped_update_count"],
+            "run_time_sec": summary["run_time_sec"],
+            "best_checkpoint_path": summary["best_checkpoint_path"],
+            "latest_checkpoint_path": summary["latest_checkpoint_path"],
+            "best_short_loss": best_bucket_flat.get("short_loss", ""),
+            "best_medium_loss": best_bucket_flat.get("medium_loss", ""),
+            "best_long_loss": best_bucket_flat.get("long_loss", ""),
+            "best_short_perplexity": best_bucket_flat.get("short_perplexity", ""),
+            "best_medium_perplexity": best_bucket_flat.get("medium_perplexity", ""),
+            "best_long_perplexity": best_bucket_flat.get("long_perplexity", ""),
+        }
+        self.metrics_writer.log_training_summary(csv_row)
+
+        return summary
+
+    def train(
+        self,
+        train_dataset: Dataset,
+        eval_dataset: Optional[Dataset] = None,
+        batch_size: int = 4,
+        num_epochs: int = 3,
+        learning_rate: float = 5e-5,
+        gradient_accumulation_steps: int = 1,
+        weight_decay: float = 0.01,
+        lr_scheduler_type: str = "cosine",
+        warmup_ratio: float = 0.03,
+        max_grad_norm: float = 1.0,
+        log_interval: int = 1,
+        save_interval_epochs: int = 2,
+        early_stopping_patience: int = 5,
+        early_stopping_monitor: str = "eval_loss",
+        early_stopping_min_delta: Optional[float] = None,
+        early_stopping_warmup_epochs: int = 0,
+        resume_from_checkpoint: bool = True,
+        eval_interval_epochs: int = 1,
+        metrics_log_interval_steps: int = 50,
+        save_best_k: int = 3,
+        save_latest_k: int = 2,
+        save_on_improve_delta: float = 0.001,
+        cleanup_old_checkpoints: bool = False,
+        scheduler_target_epochs: Optional[int] = None,
+        eval_short_max_tokens: int = 64,
+        eval_medium_max_tokens: int = 256,
+    ):
         """主訓練函數"""
-        
+
         self.logger.info("***** 開始訓練 *****")
-        
-        # 設置早停
+        self.eval_short_max_tokens = max(1, int(eval_short_max_tokens))
+        self.eval_medium_max_tokens = max(self.eval_short_max_tokens + 1, int(eval_medium_max_tokens))
+
+        early_stopping_monitor = str(early_stopping_monitor).strip().lower()
+        if early_stopping_monitor not in {"train_loss", "eval_loss"}:
+            raise ValueError(f"不支援的 early_stopping_monitor: {early_stopping_monitor}")
+        early_stopping_warmup_epochs = max(0, int(early_stopping_warmup_epochs))
+        effective_early_stopping_delta = (
+            max(0.0, float(early_stopping_min_delta))
+            if early_stopping_min_delta is not None
+            else max(0.0, float(save_on_improve_delta))
+        )
+
         if early_stopping_patience > 0:
             self.early_stopping = EarlyStoppingCallback(
                 patience=early_stopping_patience,
-                min_delta=0.001,
+                min_delta=effective_early_stopping_delta,
                 mode='min'
             )
-        
-        # 設置訓練組件
-        train_dataloader, optimizer, scheduler, scaler = self.setup_training_components(
-            train_dataset, batch_size, num_epochs, learning_rate,
-            weight_decay, gradient_accumulation_steps, warmup_ratio, lr_scheduler_type
+            self.logger.info(
+                f"早停配置 - monitor: {early_stopping_monitor}, patience: {early_stopping_patience}, "
+                f"min_delta: {effective_early_stopping_delta}, warmup_epochs: {early_stopping_warmup_epochs}"
+            )
+
+        if scheduler_target_epochs is None and early_stopping_patience > 0:
+            scheduler_target_epochs = min(num_epochs, max(20, early_stopping_patience * 3))
+
+        self.checkpoint_manager = CheckpointManager(
+            output_dir=self.output_dir,
+            policy=CheckpointPolicy(
+                save_interval_epochs=save_interval_epochs,
+                keep_best_k=save_best_k,
+                keep_latest_k=save_latest_k,
+                save_on_improve_delta=save_on_improve_delta,
+                cleanup_old_checkpoints=cleanup_old_checkpoints,
+            ),
+            logger=self.logger,
         )
-        
-        # 設置評估數據加載器
+
+        train_dataloader, optimizer, scheduler, scaler = self.setup_training_components(
+            train_dataset,
+            batch_size,
+            num_epochs,
+            learning_rate,
+            weight_decay,
+            gradient_accumulation_steps,
+            warmup_ratio,
+            lr_scheduler_type,
+            scheduler_target_epochs=scheduler_target_epochs,
+        )
+
         eval_dataloader = None
         if eval_dataset:
             collate_fn = partial(
@@ -626,7 +1249,7 @@ class AdvancedNagatoSakuraTrainer:
                 max_seq_length=self.model_config.max_position_embeddings,
                 pack_sequences=False
             )
-            
+
             eval_dataloader = DataLoader(
                 eval_dataset,
                 batch_size=batch_size * 2,
@@ -635,120 +1258,280 @@ class AdvancedNagatoSakuraTrainer:
                 num_workers=0,
                 pin_memory=self.device.type == 'cuda'
             )
-        
-        # 恢復檢查點
+
         if resume_from_checkpoint:
             latest_checkpoint = self.find_latest_checkpoint()
-            if latest_checkpoint:
-                if self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
-                    self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
-        
-        # 訓練循環
+            if latest_checkpoint and self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
+                self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
+
+        early_stopped = False
+        run_status = "running"
+        run_start_time = time.time()
+        epochs_completed = 0
+        final_eval_metrics: Optional[Dict[str, Any]] = None
+        eval_history: List[Dict[str, Any]] = []
+        run_aggregates = {
+            "tokens_seen": 0,
+            "invalid_loss_count": 0,
+            "invalid_grad_count": 0,
+            "skipped_update_count": 0,
+        }
+
         try:
             for epoch in range(self.current_epoch, num_epochs):
                 self.current_epoch = epoch
                 self.logger.info(f"=== Epoch {epoch + 1}/{num_epochs} ===")
-                
-                # 訓練一個epoch
-                # 如果log_interval為0，則不在epoch內記錄；否則將epoch分為log_interval次記錄
-                log_steps_per_epoch = max(1, 10) if log_interval == 0 else max(1, 10)
-                epoch_loss = self.train_epoch(
-                    train_dataloader, optimizer, scheduler, scaler,
-                    gradient_accumulation_steps, max_grad_norm, log_steps_per_epoch
+
+                epoch_stats = self.train_epoch(
+                    train_dataloader,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    gradient_accumulation_steps,
+                    max_grad_norm,
+                    log_steps_per_epoch=10,
+                    metrics_log_interval_steps=metrics_log_interval_steps,
                 )
-                
-                # 記錄epoch結果
+                epoch_loss = float(epoch_stats["avg_loss"])
                 self.training_history['train_loss'].append(epoch_loss)
-                
-                # 根據log_interval決定是否記錄詳細信息
-                should_log_details = (log_interval <= 0) or ((epoch + 1) % log_interval == 0)
-                
+                epochs_completed += 1
+                run_aggregates["tokens_seen"] += int(epoch_stats.get("tokens_seen", 0))
+                run_aggregates["invalid_loss_count"] += int(epoch_stats.get("invalid_loss_count", 0))
+                run_aggregates["invalid_grad_count"] += int(epoch_stats.get("invalid_grad_count", 0))
+                run_aggregates["skipped_update_count"] += int(epoch_stats.get("skipped_update_count", 0))
+
+                should_log_details = (log_interval <= 1) or ((epoch + 1) % log_interval == 0)
                 if should_log_details:
                     self.logger.info(f"Epoch {epoch + 1} 完成 - 平均損失: {epoch_loss:.4f}")
-                
-                # 評估
+
+                had_anomaly = (epoch_stats["invalid_loss_count"] > 0) or (epoch_stats["invalid_grad_count"] > 0)
+
+                run_eval = bool(eval_dataloader) and (
+                    eval_interval_epochs <= 1
+                    or (epoch + 1) % eval_interval_epochs == 0
+                    or epoch == 0
+                    or epoch == num_epochs - 1
+                )
+
                 eval_loss = None
-                should_save_checkpoint = False
+                perplexity = None
                 is_best = False
-                
-                # 評估（每個epoch都評估，但記錄根據log_interval調整）
-                eval_loss = None
-                should_save_checkpoint = False
-                is_best = False
-                
-                if eval_dataloader:
+                previous_best = self.best_eval_loss
+
+                if run_eval:
                     eval_metrics = self.evaluate(eval_dataloader)
                     eval_loss = eval_metrics.get('eval_loss', float('inf'))
                     perplexity = eval_metrics.get('perplexity', float('inf'))
-                    
+                    eval_time_sec = eval_metrics.get('eval_time_sec', 0.0)
+                    bucket_metrics = eval_metrics.get("bucket_metrics", {})
+                    bucket_metrics_flat = self._flatten_bucket_metrics(bucket_metrics)
+
                     self.training_history['eval_loss'].append(eval_loss)
                     self.training_history['perplexity'].append(perplexity)
-                    
-                    if should_log_details:
-                        self.logger.info(f"評估結果 - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
-                    
-                    # 檢查是否是最佳模型
-                    if eval_loss < self.best_eval_loss:
+                    eval_history.append({
+                        "epoch": epoch + 1,
+                        "global_step": self.global_step,
+                        "eval_loss": eval_loss,
+                        "perplexity": perplexity,
+                        "total_tokens": eval_metrics.get("total_tokens", 0),
+                        "eval_time_sec": eval_time_sec,
+                        "bucket_metrics": bucket_metrics,
+                    })
+
+                    improved = eval_loss < previous_best
+                    is_best = improved
+                    if improved:
                         self.best_eval_loss = eval_loss
-                        is_best = True
-                        should_save_checkpoint = True
                         if should_log_details:
                             self.logger.info(f"🎉 新的最佳模型! 評估損失: {eval_loss:.4f}")
-                    
-                    # 早停檢查
-                    if self.early_stopping and self.early_stopping(eval_loss):
-                        self.logger.info(f"早停觸發! 最佳評估損失: {self.best_eval_loss:.4f}")
-                        self.save_checkpoint(
-                            f"checkpoint-early-stop-epoch-{epoch + 1}",
-                            optimizer, scheduler, scaler, False
+
+                    if should_log_details:
+                        self.logger.info(f"評估結果 - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
+
+                    self.metrics_writer.log_eval_metrics({
+                        "epoch": epoch + 1,
+                        "global_step": self.global_step,
+                        "eval_loss": eval_loss,
+                        "perplexity": perplexity,
+                        "total_tokens": eval_metrics.get("total_tokens", 0),
+                        "eval_time_sec": eval_time_sec,
+                        "improved": improved,
+                        "is_best": is_best,
+                        **bucket_metrics_flat,
+                    })
+
+                early_stop_score: Optional[float] = None
+                if self.early_stopping:
+                    if early_stopping_monitor == "train_loss":
+                        early_stop_score = float(epoch_loss)
+                    elif eval_loss is not None and math.isfinite(float(eval_loss)):
+                        early_stop_score = float(eval_loss)
+
+                if self.early_stopping and early_stop_score is not None:
+                    if (epoch + 1) <= early_stopping_warmup_epochs:
+                        if should_log_details:
+                            self.logger.info(
+                                f"早停預熱中({epoch + 1}/{early_stopping_warmup_epochs}) - "
+                                f"monitor: {early_stopping_monitor}, score: {early_stop_score:.6f}"
+                            )
+                    else:
+                        should_stop = self.early_stopping(early_stop_score)
+                        if should_log_details:
+                            self.logger.info(
+                                f"早停監控({early_stopping_monitor}={early_stop_score:.6f}) - "
+                                f"patience剩餘: {self.early_stopping.patience_remaining}/"
+                                f"{self.early_stopping.patience}"
+                            )
+                        if should_stop:
+                            early_stopped = True
+                            run_status = "early_stopped"
+                            self.logger.info(f"早停觸發! monitor={early_stopping_monitor}, score={early_stop_score:.6f}")
+                            self.metrics_writer.log_event({
+                                "epoch": epoch + 1,
+                                "global_step": self.global_step,
+                                "event_type": "early_stopping",
+                                "severity": "INFO",
+                                "message": f"early stopping triggered on {early_stopping_monitor}",
+                                "value": early_stop_score,
+                            })
+                elif self.early_stopping and should_log_details and early_stopping_monitor == "eval_loss":
+                    self.logger.info("早停監控(eval_loss) - 本epoch無評估結果，略過")
+
+                save_reasons = self.checkpoint_manager.should_save(
+                    epoch=epoch,
+                    num_epochs=num_epochs,
+                    eval_loss=eval_loss,
+                    previous_best_eval_loss=previous_best,
+                    had_anomaly=had_anomaly,
+                )
+                if is_best and "best" not in save_reasons:
+                    save_reasons.append("best")
+                if early_stopped and "early_stop" not in save_reasons:
+                    save_reasons.append("early_stop")
+
+                if save_reasons:
+                    checkpoint_name = f"checkpoint-epoch-{epoch + 1}"
+                    checkpoint_path = self.save_checkpoint(
+                        checkpoint_name,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        is_best=is_best,
+                        checkpoint_reasons=save_reasons,
+                        eval_loss=eval_loss,
+                    )
+                    if checkpoint_path is not None:
+                        self.checkpoint_manager.register_checkpoint(
+                            checkpoint_path=checkpoint_path,
+                            checkpoint_name=checkpoint_name,
+                            epoch=epoch + 1,
+                            eval_loss=eval_loss,
+                            is_best=is_best,
+                            reasons=save_reasons,
                         )
-                        break
-                
-                # WandB記錄（總是記錄基本信息）
+
                 if self.use_wandb:
                     log_data = {
                         "epoch": epoch + 1,
-                        "train/epoch_loss": epoch_loss
+                        "train/epoch_loss": epoch_loss,
+                        "train/invalid_loss_count": epoch_stats["invalid_loss_count"],
+                        "train/invalid_grad_count": epoch_stats["invalid_grad_count"],
+                        "train/skipped_update_count": epoch_stats["skipped_update_count"],
                     }
                     if eval_loss is not None:
                         log_data.update({
                             "eval/loss": eval_loss,
-                            "eval/perplexity": perplexity
+                            "eval/perplexity": perplexity,
                         })
                     wandb.log(log_data)
-                
-                # 檢查是否需要保存checkpoint
-                if (epoch + 1) % save_interval_epochs == 0:
-                    should_save_checkpoint = True
-                
-                if epoch == num_epochs - 1:
-                    should_save_checkpoint = True
-                
-                # 保存檢查點
-                if should_save_checkpoint:
-                    self.save_checkpoint(
-                        f"checkpoint-epoch-{epoch + 1}",
-                        optimizer, scheduler, scaler, is_best
-                    )
-            
-            # 訓練完成
+
+                if early_stopped:
+                    break
+
+            if run_status == "running":
+                run_status = "completed"
+
             self.logger.info("***** 訓練完成 *****")
-            self.save_checkpoint("final_model", optimizer, scheduler, scaler)
-            
-            # 最終評估
+
+            if early_stopped and self._load_best_model_weights():
+                self.logger.info("早停後已回滾到最佳模型權重")
+
+            final_checkpoint_path = self.save_checkpoint(
+                "final_model",
+                optimizer,
+                scheduler,
+                scaler,
+                is_best=False,
+                checkpoint_reasons=["final_export"],
+                eval_loss=self.best_eval_loss if math.isfinite(self.best_eval_loss) else None,
+            )
+            if final_checkpoint_path is not None and self.checkpoint_manager is not None:
+                self.checkpoint_manager.register_checkpoint(
+                    checkpoint_path=final_checkpoint_path,
+                    checkpoint_name="final_model",
+                    epoch=self.current_epoch + 1,
+                    eval_loss=self.best_eval_loss if math.isfinite(self.best_eval_loss) else None,
+                    is_best=False,
+                    reasons=["final_export"],
+                )
+
             if eval_dataloader:
-                final_metrics = self.evaluate(eval_dataloader)
-                self.logger.info(f"最終評估結果: {final_metrics}")
-            
+                final_eval_metrics = self.evaluate(eval_dataloader)
+                self.logger.info(f"最終評估結果: {final_eval_metrics}")
+
         except KeyboardInterrupt:
+            run_status = "interrupted"
             self.logger.info("訓練被用戶中斷")
+            self.metrics_writer.log_event({
+                "epoch": self.current_epoch + 1,
+                "global_step": self.global_step,
+                "event_type": "keyboard_interrupt",
+                "severity": "INFO",
+                "message": "training interrupted by user",
+                "value": "",
+            })
             self.save_checkpoint(
                 f"checkpoint-interrupted-step-{self.global_step}",
-                optimizer, scheduler, scaler
+                optimizer,
+                scheduler,
+                scaler,
+                is_best=False,
+                checkpoint_reasons=["interrupted"],
+                eval_loss=None,
             )
         except Exception as e:
+            run_status = "failed"
+            self.metrics_writer.log_event({
+                "epoch": self.current_epoch + 1,
+                "global_step": self.global_step,
+                "event_type": "training_exception",
+                "severity": "ERROR",
+                "message": str(e),
+                "value": "",
+            })
             self.logger.error(f"訓練過程中發生錯誤: {e}", exc_info=True)
             raise
         finally:
+            checkpoint_overview = {}
+            if self.checkpoint_manager is not None:
+                try:
+                    checkpoint_overview = self.checkpoint_manager.export_index(self.output_dir / "metrics")
+                except Exception as e:
+                    self.logger.warning(f"checkpoint 索引匯出失敗: {e}")
+
+            try:
+                self._export_training_summary(
+                    run_status=run_status,
+                    epochs_planned=num_epochs,
+                    epochs_completed=epochs_completed,
+                    run_start_time=run_start_time,
+                    run_aggregates=run_aggregates,
+                    eval_history=eval_history,
+                    final_eval_metrics=final_eval_metrics,
+                    checkpoint_overview=checkpoint_overview,
+                )
+            except Exception as e:
+                self.logger.warning(f"訓練摘要匯出失敗: {e}")
+
             if self.use_wandb:
                 wandb.finish()
