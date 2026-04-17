@@ -3,7 +3,7 @@ import shutil
 import csv
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -166,7 +166,7 @@ class CheckpointManager:
                 "is_best": bool(record.get("is_best")) if record else (d.name == "best_model"),
                 "reasons": "|".join(record.get("reasons", [])) if record else "",
                 "size_mb": round(self._folder_size_mb(d), 3),
-                "modified_time": datetime.utcfromtimestamp(d.stat().st_mtime).isoformat(timespec="seconds") + "Z",
+                "modified_time": datetime.fromtimestamp(d.stat().st_mtime, UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 "has_model": (d / "model.pt").exists(),
                 "has_state": (d / "training_state.pt").exists(),
             }
@@ -196,7 +196,7 @@ class CheckpointManager:
         latest_row = rows[0] if rows else None
 
         overview = {
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "total_checkpoints": len(rows),
             "total_size_mb": round(sum(float(r.get("size_mb", 0.0)) for r in rows), 3),
             "best_checkpoint_path": best_row.get("checkpoint_path") if best_row else "",

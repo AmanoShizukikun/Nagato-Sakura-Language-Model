@@ -176,21 +176,42 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """應用旋轉位置編碼"""
     if cos.dim() == 4:
         cos = cos.squeeze(0).squeeze(0)
     if sin.dim() == 4:
         sin = sin.squeeze(0).squeeze(0)
-    if cos.shape[0] < q.shape[2]:
-        q = q[:, :, :cos.shape[0], :]
-        k = k[:, :, :cos.shape[0], :]
-    elif cos.shape[0] > q.shape[2]:
-        cos = cos[:q.shape[2], :]
-        sin = sin[:q.shape[2], :]
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+
+    if position_ids is not None:
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        if position_ids.shape[-1] != q.shape[-2]:
+            raise ValueError(
+                f"position_ids length {position_ids.shape[-1]} does not match q_len {q.shape[-2]}"
+            )
+        if position_ids.numel() > 0:
+            max_position_id = int(position_ids.max().item())
+            if max_position_id >= cos.shape[0]:
+                raise ValueError(
+                    f"position_ids max {max_position_id} exceeds rotary cache length {cos.shape[0]}"
+                )
+        cos = cos[position_ids].unsqueeze(1)
+        sin = sin[position_ids].unsqueeze(1)
+    else:
+        target_len = q.shape[-2]
+        if cos.shape[0] < target_len:
+            raise ValueError(
+                f"rotary cache length {cos.shape[0]} is smaller than q_len {target_len}"
+            )
+        cos = cos[:target_len, :].unsqueeze(0).unsqueeze(0)
+        sin = sin[:target_len, :].unsqueeze(0).unsqueeze(0)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -250,12 +271,55 @@ class NSAttention(nn.Module):
             use_residual_sign=getattr(config, "kv_residual_sign_correction", False),
         )
 
+    @staticmethod
+    def _mask_has_query_dependent_values(attention_mask: Optional[torch.Tensor]) -> bool:
+        if attention_mask is None or attention_mask.dim() != 4 or attention_mask.shape[-2] <= 1:
+            return False
+        reference = attention_mask[..., :1, :]
+        return bool((attention_mask != reference).any().item())
+
+    @classmethod
+    def _mask_encodes_causality(
+        cls,
+        attention_mask: Optional[torch.Tensor],
+        query_length: int,
+        past_key_values_length: int = 0,
+    ) -> bool:
+        if attention_mask is None or attention_mask.dim() != 4 or attention_mask.shape[-2] != query_length:
+            return False
+        key_length = attention_mask.shape[-1]
+        if key_length < past_key_values_length + query_length:
+            return False
+
+        query_positions = torch.arange(
+            past_key_values_length,
+            past_key_values_length + query_length,
+            device=attention_mask.device,
+        )
+        key_positions = torch.arange(key_length, device=attention_mask.device)
+        future_positions = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        if not bool(future_positions.any().item()):
+            return key_length > query_length or cls._mask_has_query_dependent_values(attention_mask)
+
+        future_positions = future_positions.view(1, 1, query_length, key_length)
+
+        if attention_mask.dtype == torch.bool:
+            blocked_positions = ~attention_mask
+        elif torch.is_floating_point(attention_mask):
+            floor_value = torch.finfo(attention_mask.dtype).min / 2
+            blocked_positions = torch.isneginf(attention_mask) | (attention_mask <= floor_value)
+        else:
+            blocked_positions = attention_mask == 0
+
+        return bool(blocked_positions.masked_select(future_positions.expand_as(blocked_positions)).all().item())
+
     def _sdpa_attention_forward(
         self,
         query_states: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         """PyTorch SDPA 前向傳播"""
         attn_output = F.scaled_dot_product_attention(
@@ -264,7 +328,7 @@ class NSAttention(nn.Module):
             value_states,
             attn_mask=attention_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=attention_mask is None,  # 如果沒有自定義掩碼，使用因果掩碼
+            is_causal=bool(is_causal),
             scale=self.scale
         )
         return attn_output
@@ -275,14 +339,32 @@ class NSAttention(nn.Module):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """標準注意力機制前向傳播"""
         # 計算注意力分數
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+
+        if is_causal:
+            q_len = query_states.shape[-2]
+            kv_len = key_states.shape[-2]
+            causal_offset = max(0, kv_len - q_len)
+            causal_mask = torch.ones(
+                (q_len, kv_len),
+                device=query_states.device,
+                dtype=torch.bool,
+            ).triu(diagonal=1 + causal_offset)
+            attn_weights = attn_weights.masked_fill(
+                causal_mask.unsqueeze(0).unsqueeze(0),
+                torch.finfo(attn_weights.dtype).min,
+            )
         
         # 應用注意力掩碼
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            if attention_mask.dtype == torch.bool:
+                attn_weights = attn_weights.masked_fill(~attention_mask, torch.finfo(attn_weights.dtype).min)
+            else:
+                attn_weights = attn_weights + attention_mask
         
         # Softmax
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -301,6 +383,7 @@ class NSAttention(nn.Module):
         past_key_value: Optional[PastKeyValue] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        is_causal: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PastKeyValue]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -327,23 +410,36 @@ class NSAttention(nn.Module):
             past_kv_len = past_key_states.shape[-2]
             kv_seq_len += past_kv_len
 
-        # 應用 RoPE
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        
         # 處理位置 ID
-        if position_ids is None:
-            position_ids = torch.arange(
-                past_kv_len, past_kv_len + q_len, 
-                device=hidden_states.device, dtype=torch.long
-            ).unsqueeze(0)
+        rope_seq_len = kv_seq_len
+        rope_position_ids = position_ids
 
         # 確保position_ids維度正確
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
+        if rope_position_ids is not None:
+            if rope_position_ids.dim() == 1:
+                rope_position_ids = rope_position_ids.unsqueeze(0)
+            if rope_position_ids.device != hidden_states.device or rope_position_ids.dtype != torch.long:
+                rope_position_ids = rope_position_ids.to(device=hidden_states.device, dtype=torch.long)
+
+            if rope_position_ids.numel() > 0:
+                rope_seq_len = max(rope_seq_len, int(rope_position_ids.max().item()) + 1)
+
+        # 應用 RoPE
+        cos, sin = self.rotary_emb(value_states, seq_len=rope_seq_len)
+        if rope_position_ids is None and past_kv_len > 0:
+            rotary_end = past_kv_len + q_len
+            cos = cos[:, :, past_kv_len:rotary_end, :]
+            sin = sin[:, :, past_kv_len:rotary_end, :]
         
         # RoPE應用
         try:
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                position_ids=rope_position_ids,
+            )
         except Exception as e:
             logger.warning(f"RoPE應用失敗，跳過: {e}")
 
@@ -361,22 +457,23 @@ class NSAttention(nn.Module):
 
         # 選擇注意力實現
         attn_weights = None
+        effective_is_causal = bool(is_causal)
         
         if self.use_sdpa and not output_attentions:
             # PyTorch SDPA（不支援輸出注意力權重）
             try:
                 attn_output = self._sdpa_attention_forward(
-                    query_states, key_states, value_states, attention_mask
+                    query_states, key_states, value_states, attention_mask, is_causal=effective_is_causal
                 )
             except Exception as e:
                 logger.warning(f"SDPA 失敗，回退到標準注意力: {e}")
                 attn_output, attn_weights = self._standard_attention_forward(
-                    query_states, key_states, value_states, attention_mask
+                    query_states, key_states, value_states, attention_mask, is_causal=effective_is_causal
                 )
         else:
             # 標準注意力機制
             attn_output, attn_weights = self._standard_attention_forward(
-                query_states, key_states, value_states, attention_mask
+                query_states, key_states, value_states, attention_mask, is_causal=effective_is_causal
             )
 
         # 重塑輸出
@@ -434,6 +531,7 @@ class NSDecoderLayer(nn.Module):
         past_key_value: Optional[PastKeyValue] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        is_causal: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PastKeyValue]]:
         residual = hidden_states
 
@@ -447,6 +545,7 @@ class NSDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            is_causal=is_causal,
         )
         
         attn_output = attn_outputs[0]
@@ -983,12 +1082,154 @@ class NagatoSakuraModel(nn.Module):
         }
 
     def _prepare_decoder_attention_mask(
-        self, attention_mask: Optional[torch.Tensor], input_shape: Tuple[int, int], 
-        inputs_embeds: torch.Tensor, past_key_values_length: int
+        self,
+        attention_mask: Optional[torch.Tensor],
+        input_shape: Tuple[int, int],
+        inputs_embeds: torch.Tensor,
+        past_key_values_length: int,
+        sdpa_mode: bool = False,
     ) -> Optional[torch.Tensor]:
         """準備解碼器注意力掩碼（增強版）"""
         bsz, seq_len = input_shape
         combined_attention_mask = None
+
+        def _normalize_4d_attention_mask(mask: torch.Tensor, *, for_sdpa: bool) -> torch.Tensor:
+            normalized_mask = mask.to(inputs_embeds.device)
+            if normalized_mask.dtype != torch.bool and not torch.is_floating_point(normalized_mask):
+                treat_as_boolean_mask = normalized_mask.dtype == torch.uint8
+                if not treat_as_boolean_mask:
+                    unique_values = torch.unique(normalized_mask)
+                    if unique_values.numel() <= 2 and bool((unique_values == 0).any().item()):
+                        nonzero_values = unique_values[unique_values != 0]
+                        treat_as_boolean_mask = bool(
+                            nonzero_values.numel() == 0
+                            or (nonzero_values.abs() == 1).all().item()
+                        )
+
+                if treat_as_boolean_mask:
+                    normalized_mask = normalized_mask != 0
+                else:
+                    normalized_mask = normalized_mask.to(dtype=inputs_embeds.dtype)
+
+            if not for_sdpa and normalized_mask.shape[-2] > 1:
+                reference = normalized_mask[..., :1, :]
+                if not bool((normalized_mask != reference).any().item()):
+                    normalized_mask = reference
+
+            if not for_sdpa and normalized_mask.dtype == torch.bool:
+                additive_mask = torch.zeros_like(normalized_mask, dtype=inputs_embeds.dtype)
+                additive_mask = additive_mask.masked_fill(
+                    ~normalized_mask,
+                    torch.finfo(inputs_embeds.dtype).min,
+                )
+                normalized_mask = additive_mask
+            elif not for_sdpa and not torch.is_floating_point(normalized_mask):
+                normalized_mask = normalized_mask.to(dtype=inputs_embeds.dtype)
+
+            return normalized_mask
+
+        def _build_sdpa_causal_mask(total_key_length: int) -> torch.Tensor:
+            key_positions = torch.arange(total_key_length, device=inputs_embeds.device)
+            query_positions = torch.arange(
+                past_key_values_length,
+                past_key_values_length + seq_len,
+                device=inputs_embeds.device,
+            )
+            return (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)).view(1, 1, seq_len, total_key_length)
+
+        def _canonicalize_cached_4d_sdpa_mask(mask: torch.Tensor) -> torch.Tensor:
+            base_mask = mask
+            mask_width = base_mask.shape[-1]
+
+            if mask_width == seq_len:
+                raise ValueError(
+                    "cached 4D attention_mask must include the full past+current key width; "
+                    "a current-step-only 4D mask cannot preserve masked prefix keys"
+                )
+            elif mask_width != total_kv_len:
+                raise ValueError(
+                    f"4D attention_mask width {mask_width} does not match seq_len {seq_len} "
+                    f"or total_kv_len {total_kv_len}"
+                )
+            else:
+                base_mask = base_mask.to(device=inputs_embeds.device)
+
+            causal_mask = _build_sdpa_causal_mask(base_mask.shape[-1])
+            expanded_mask = base_mask.expand(*base_mask.shape[:-2], seq_len, base_mask.shape[-1])
+
+            if expanded_mask.dtype == torch.bool:
+                return expanded_mask & causal_mask.expand_as(expanded_mask)
+
+            if not torch.is_floating_point(expanded_mask):
+                expanded_mask = expanded_mask.to(dtype=inputs_embeds.dtype)
+
+            additive_causal = torch.zeros(
+                (1, 1, seq_len, base_mask.shape[-1]),
+                dtype=expanded_mask.dtype,
+                device=inputs_embeds.device,
+            )
+            additive_causal = additive_causal.masked_fill(
+                ~causal_mask,
+                torch.finfo(expanded_mask.dtype).min,
+            )
+            return expanded_mask + additive_causal
+
+        if sdpa_mode:
+            total_kv_len = seq_len + past_key_values_length
+
+            if attention_mask is None:
+                if past_key_values_length <= 0:
+                    return None
+                attention_mask = torch.ones(
+                    (bsz, seq_len),
+                    dtype=torch.bool,
+                    device=inputs_embeds.device,
+                )
+
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)
+                if bool(attention_mask.all().item()) and past_key_values_length <= 0:
+                    return None
+
+                if past_key_values_length > 0:
+                    mask_width = attention_mask.shape[-1]
+                    if mask_width == seq_len:
+                        past_mask = torch.ones(
+                            (bsz, past_key_values_length),
+                            dtype=torch.bool,
+                            device=inputs_embeds.device,
+                        )
+                        key_mask = torch.cat([past_mask, attention_mask], dim=-1)
+                    elif mask_width == total_kv_len:
+                        key_mask = attention_mask
+                    else:
+                        raise ValueError(
+                            f"attention_mask width {mask_width} does not match seq_len {seq_len} "
+                            f"or total_kv_len {total_kv_len}"
+                        )
+
+                    key_positions = torch.arange(total_kv_len, device=inputs_embeds.device)
+                    query_positions = torch.arange(
+                        past_key_values_length,
+                        total_kv_len,
+                        device=inputs_embeds.device,
+                    )
+                    expanded_attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                    expanded_attn_mask = expanded_attn_mask.view(1, 1, seq_len, total_kv_len).expand(
+                        bsz, 1, seq_len, total_kv_len
+                    )
+                    return expanded_attn_mask & key_mask[:, None, None, :]
+
+                expanded_attn_mask = attention_mask[:, None, None, :]
+                return expanded_attn_mask
+
+            if attention_mask.dim() == 4:
+                normalized_mask = _normalize_4d_attention_mask(attention_mask, for_sdpa=True)
+                if past_key_values_length > 0:
+                    return _canonicalize_cached_4d_sdpa_mask(normalized_mask)
+                return normalized_mask
+
+            raise ValueError(f"Unsupported attention_mask dims for SDPA: {attention_mask.dim()}")
 
         # 創建因果掩碼
         if seq_len > 1:
@@ -1007,7 +1248,7 @@ class NagatoSakuraModel(nn.Module):
                 ).to(inputs_embeds.device)
             else:
                 # 如果已經是4D，直接使用
-                expanded_attn_mask = attention_mask.to(inputs_embeds.device)
+                expanded_attn_mask = _normalize_4d_attention_mask(attention_mask, for_sdpa=False)
 
             if combined_attention_mask is None:
                 combined_attention_mask = expanded_attn_mask
@@ -1084,9 +1325,34 @@ class NagatoSakuraModel(nn.Module):
             position_ids = position_ids.unsqueeze(0).expand(batch_size, seq_length)
         else:
             # 驗證位置ID
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            if position_ids.shape[0] == 1 and batch_size > 1:
+                position_ids = position_ids.expand(batch_size, -1)
             if position_ids.shape != (batch_size, seq_length):
-                logger.warning(f"position_ids 形狀不匹配: {position_ids.shape} vs 期望 {(batch_size, seq_length)}")
-                position_ids = position_ids[:batch_size, :seq_length]
+                can_slice_cached_positions = (
+                    position_ids.shape[0] >= batch_size and position_ids.shape[-1] >= seq_length
+                )
+                if can_slice_cached_positions:
+                    position_ids = position_ids[:batch_size]
+                    if past_key_values_length > 0:
+                        position_ids = position_ids[:, -seq_length:]
+                    else:
+                        position_ids = position_ids[:, :seq_length]
+                else:
+                    logger.warning(f"position_ids 形狀不匹配: {position_ids.shape} vs 期望 {(batch_size, seq_length)}")
+                    position_ids = position_ids[:batch_size, :seq_length]
+
+        position_ids = position_ids.to(device=device, dtype=torch.long)
+        default_position_ids = torch.arange(
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0).expand(batch_size, seq_length)
+        layer_position_ids = None
+        if not torch.equal(position_ids, default_position_ids):
+            layer_position_ids = position_ids
 
         # 詞嵌入
         if inputs_embeds is None:
@@ -1096,12 +1362,20 @@ class NagatoSakuraModel(nn.Module):
                 logger.error(f"詞嵌入失敗: {e}")
                 raise
 
+        prefer_sdpa_mask = bool(getattr(self.config, "use_sdpa", True) and SDPA_AVAILABLE and not output_attentions)
+
         # 準備注意力掩碼
         try:
             attention_mask_for_layers = self._prepare_decoder_attention_mask(
-                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+                sdpa_mode=prefer_sdpa_mask,
             )
         except Exception as e:
+            if attention_mask is not None and attention_mask.dim() == 4:
+                raise
             logger.warning(f"注意力掩碼準備失敗: {e}，使用簡化版本")
             if seq_length > 1:
                 attention_mask_for_layers = _make_causal_mask(
@@ -1112,6 +1386,12 @@ class NagatoSakuraModel(nn.Module):
                 attention_mask_for_layers = None
 
         hidden_states = inputs_embeds
+        has_explicit_causal_mask = NSAttention._mask_encodes_causality(
+            attention_mask_for_layers,
+            seq_length,
+            past_key_values_length=past_key_values_length,
+        )
+        layer_is_causal = bool(not has_explicit_causal_mask)
 
         # 初始化輸出收集器
         all_hidden_states = () if output_hidden_states else None
@@ -1136,10 +1416,11 @@ class NagatoSakuraModel(nn.Module):
                         decoder_layer,
                         hidden_states,
                         attention_mask_for_layers,
-                        position_ids,
+                        layer_position_ids,
                         past_key_value,
                         output_attentions,
                         use_cache,
+                        layer_is_causal,
                         use_reentrant=False  # 使用新的檢查點實現
                     )
                 except Exception as e:
@@ -1147,20 +1428,22 @@ class NagatoSakuraModel(nn.Module):
                     layer_outputs = decoder_layer(
                         hidden_states,
                         attention_mask=attention_mask_for_layers,
-                        position_ids=position_ids,
+                        position_ids=layer_position_ids,
                         past_key_value=past_key_value,
                         output_attentions=output_attentions,
                         use_cache=use_cache,
+                        is_causal=layer_is_causal,
                     )
             else:
                 # 正常前向傳播
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask_for_layers,
-                    position_ids=position_ids,
+                    position_ids=layer_position_ids,
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    is_causal=layer_is_causal,
                 )
 
             # 提取層輸出
@@ -1172,10 +1455,11 @@ class NagatoSakuraModel(nn.Module):
                 raise ValueError(f"層 {idx} 計算異常")
 
             # 安全地處理cache
-            if use_cache and len(layer_outputs) > 2 and layer_outputs[2] is not None:
+            present_key_value_index = 2 if output_attentions else 1
+            if use_cache and len(layer_outputs) > present_key_value_index and layer_outputs[present_key_value_index] is not None:
                 if next_decoder_cache is None:
                     next_decoder_cache = []
-                next_decoder_cache.append(layer_outputs[2])
+                next_decoder_cache.append(layer_outputs[present_key_value_index])
 
             # 處理注意力權重
             if output_attentions and len(layer_outputs) > 1 and layer_outputs[1] is not None:
@@ -1336,6 +1620,7 @@ class NagatoSakuraForCausalLM(nn.Module):
 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
+        logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -1345,8 +1630,6 @@ class NagatoSakuraForCausalLM(nn.Module):
             
             # 計算損失
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            if shift_logits.dtype in (torch.float16, torch.bfloat16):
-                shift_logits = shift_logits.float()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
@@ -1365,12 +1648,18 @@ class NagatoSakuraForCausalLM(nn.Module):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
-        position_ids = kwargs.get("position_ids", None)
+        position_ids = self._normalize_generation_position_ids(
+            kwargs.get("position_ids", None),
+            input_ids.device,
+        )
         if attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.to(device=input_ids.device, dtype=torch.long)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
+        elif position_ids is not None and past_key_values is not None:
+            position_ids = position_ids[:, -input_ids.shape[1]:]
 
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
@@ -1386,6 +1675,18 @@ class NagatoSakuraForCausalLM(nn.Module):
             }
         )
         return model_inputs
+
+    @staticmethod
+    def _normalize_generation_position_ids(
+        position_ids: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Optional[torch.LongTensor]:
+        if position_ids is None:
+            return None
+        position_ids = position_ids.to(device=device, dtype=torch.long)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        return position_ids
 
     @staticmethod
     def _reorder_cache(past_key_values: List[PastKeyValue], beam_idx: torch.Tensor) -> List[PastKeyValue]:
@@ -1446,6 +1747,7 @@ class NagatoSakuraForCausalLM(nn.Module):
         
         # 初始化
         past_key_values = None
+        position_ids = self._normalize_generation_position_ids(kwargs.get("position_ids"), device)
         
         # 確保注意力掩碼覆蓋初始輸入
         if attention_mask is None:
@@ -1458,18 +1760,13 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 生成循環
         for step in range(max_length - input_length):
             try:
-                # 準備模型輸入
-                model_inputs = {
-                    "input_ids": generated_ids,
-                    "attention_mask": attention_mask,
-                    "past_key_values": past_key_values,
-                    "use_cache": use_cache,
-                }
-                
-                # 如果有past_key_values，只使用最後一個token
-                if past_key_values is not None:
-                    model_inputs["input_ids"] = generated_ids[:, -1:]
-                
+                model_inputs = self.prepare_inputs_for_generation(
+                    generated_ids,
+                    past_key_values=past_key_values,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=use_cache,
+                )
                 outputs: NagatoSakuraOutput = self(**model_inputs)
                 
                 if outputs.logits is None:
@@ -1495,6 +1792,8 @@ class NagatoSakuraForCausalLM(nn.Module):
                 
                 if attention_mask is not None:
                     attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens)], dim=-1)
+                if position_ids is not None:
+                    position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=-1)
                 
                 past_key_values = outputs.past_key_values
                 
@@ -1553,6 +1852,7 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 初始化注意力掩碼
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
+        position_ids = self._normalize_generation_position_ids(kwargs.get("position_ids"), device)
         
         # 初始化生成狀態
         generated_ids = input_ids.clone()
@@ -1562,18 +1862,18 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 生成循環
         for step in range(max_new_tokens):
             try:
-                # 準備輸入
                 current_input_ids = generated_ids if past_key_values is None else generated_ids[:, -1:]
-                current_attention_mask = attention_mask
-                
-                # 前向傳播
+                model_inputs = self.prepare_inputs_for_generation(
+                    generated_ids,
+                    past_key_values=past_key_values,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+                model_inputs["input_ids"] = current_input_ids
+
                 with torch.no_grad():
-                    outputs = self(
-                        input_ids=current_input_ids,
-                        attention_mask=current_attention_mask,
-                        past_key_values=past_key_values,
-                        use_cache=True
-                    )
+                    outputs = self(**model_inputs)
                 
                 logits = outputs.logits[:, -1, :]  # 取最後一個位置的logits
                 past_key_values = outputs.past_key_values
@@ -1599,6 +1899,8 @@ class NagatoSakuraForCausalLM(nn.Module):
                 attention_mask = torch.cat([
                     attention_mask, torch.ones((batch_size, 1), device=device)
                 ], dim=1)
+                if position_ids is not None:
+                    position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=-1)
                 
                 # 檢查停止條件
                 stop_reason = None

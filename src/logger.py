@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from collections import deque
 from typing import Dict, Any
-from datetime import datetime
+from datetime import UTC, datetime
 
 import torch
 import psutil
@@ -47,6 +47,10 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
     # 清除現有處理器
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
     
     # 文件處理器
     file_handler = logging.FileHandler(
@@ -178,7 +182,7 @@ class CSVMetricsWriter:
         headers = self.SCHEMAS[filename]
         payload = {k: row.get(k, "") for k in headers}
         if not payload.get("timestamp"):
-            payload["timestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            payload["timestamp"] = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
         with self._lock:
             with open(self.metrics_dir / filename, "a", encoding="utf-8", newline="") as f:
