@@ -101,14 +101,14 @@ class TokenizerManager:
             self.logger.info("訓練新分詞器...")
             
             # 收集文本
-            all_texts = set()
+            all_texts = []
             for item in tqdm(training_data, desc="收集文本"):
                 prompt = str(item.get("prompt", "")).strip()
                 completion = str(item.get("completion", "")).strip()
                 if prompt:
-                    all_texts.add(prompt)
+                    all_texts.append(prompt)
                 if completion:
-                    all_texts.add(completion)
+                    all_texts.append(completion)
             
             if not all_texts:
                 raise ValueError("沒有收集到用於訓練分詞器的文本")

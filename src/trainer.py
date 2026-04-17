@@ -291,13 +291,18 @@ class AdvancedNagatoSakuraTrainer:
 
     def train_epoch(self, train_dataloader: DataLoader, optimizer, scheduler, 
                 scaler: GradScaler, gradient_accumulation_steps: int,
-                max_grad_norm: float, log_interval: int) -> float:
+                max_grad_norm: float, log_steps_per_epoch: int = 10) -> float:
         """訓練一個epoch"""
         
         self.model.train()
         epoch_loss = 0.0
         num_batches = 0
         accumulated_steps = 0
+        invalid_batches = 0
+        
+        # 計算日誌記錄間隔（將epoch分為log_steps_per_epoch個部分）
+        total_steps = len(train_dataloader)
+        log_interval_steps = max(1, total_steps // log_steps_per_epoch)
         
         progress_bar = tqdm(
             train_dataloader, 
@@ -308,6 +313,7 @@ class AdvancedNagatoSakuraTrainer:
         for step, batch in enumerate(progress_bar):
             # 跳過無效批次
             if batch["input_ids"] is None:
+                invalid_batches += 1
                 continue
             
             # 移動到設備
@@ -373,7 +379,7 @@ class AdvancedNagatoSakuraTrainer:
                 })
                 
                 # 記錄日誌
-                if self.global_step % log_interval == 0:
+                if self.global_step % log_interval_steps == 0:
                     avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
                     self.logger.info(
                         f"Step {self.global_step}: Loss={avg_loss:.4f}, "
@@ -390,7 +396,7 @@ class AdvancedNagatoSakuraTrainer:
                         })
                 
                 # 系統監控
-                if self.global_step % (log_interval * 5) == 0:
+                if self.global_step % (log_interval_steps * 5) == 0:
                     self.system_monitor.log_system_status(self.logger)
         
         # 處理剩餘的累積梯度
@@ -416,7 +422,20 @@ class AdvancedNagatoSakuraTrainer:
                 optimizer.zero_grad()
                 scaler.update()
         
-        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else float('inf')
+        if num_batches == 0:
+            raise RuntimeError(
+                "本 epoch 沒有任何有效批次，訓練已停止。請檢查分詞器編碼、數據格式與 collate_fn。"
+            )
+
+        total_seen_batches = num_batches + invalid_batches
+        if total_seen_batches > 0:
+            invalid_ratio = invalid_batches / total_seen_batches
+            if invalid_ratio > 0.3:
+                self.logger.warning(
+                    f"偵測到較高無效批次比例: {invalid_ratio:.1%} ({invalid_batches}/{total_seen_batches})"
+                )
+
+        avg_epoch_loss = epoch_loss / num_batches
         return avg_epoch_loss
 
     def evaluate(self, eval_dataloader: DataLoader) -> Dict[str, float]:
@@ -564,8 +583,7 @@ class AdvancedNagatoSakuraTrainer:
               batch_size: int = 4, num_epochs: int = 3, learning_rate: float = 5e-5,
               gradient_accumulation_steps: int = 1, weight_decay: float = 0.01,
               lr_scheduler_type: str = "cosine", warmup_ratio: float = 0.03,
-              max_grad_norm: float = 1.0, log_interval: int = 10,
-              save_interval_steps: int = 500, eval_interval_steps: int = 500,
+              max_grad_norm: float = 1.0, log_interval: int = 1,
               save_interval_epochs: int = 2,
               early_stopping_patience: int = 5, resume_from_checkpoint: bool = True):
         """主訓練函數"""
@@ -619,21 +637,33 @@ class AdvancedNagatoSakuraTrainer:
                 self.logger.info(f"=== Epoch {epoch + 1}/{num_epochs} ===")
                 
                 # 訓練一個epoch
+                # 如果log_interval為0，則不在epoch內記錄；否則將epoch分為log_interval次記錄
+                log_steps_per_epoch = max(1, 10) if log_interval == 0 else max(1, 10)
                 epoch_loss = self.train_epoch(
                     train_dataloader, optimizer, scheduler, scaler,
-                    gradient_accumulation_steps, max_grad_norm, log_interval
+                    gradient_accumulation_steps, max_grad_norm, log_steps_per_epoch
                 )
                 
                 # 記錄epoch結果
                 self.training_history['train_loss'].append(epoch_loss)
-                self.logger.info(f"Epoch {epoch + 1} 完成 - 平均損失: {epoch_loss:.4f}")
+                
+                # 根據log_interval決定是否記錄詳細信息
+                should_log_details = (log_interval <= 0) or ((epoch + 1) % log_interval == 0)
+                
+                if should_log_details:
+                    self.logger.info(f"Epoch {epoch + 1} 完成 - 平均損失: {epoch_loss:.4f}")
                 
                 # 評估
                 eval_loss = None
                 should_save_checkpoint = False
                 is_best = False
                 
-                if eval_dataloader and (epoch + 1) % 1 == 0:
+                # 評估（每個epoch都評估，但記錄根據log_interval調整）
+                eval_loss = None
+                should_save_checkpoint = False
+                is_best = False
+                
+                if eval_dataloader:
                     eval_metrics = self.evaluate(eval_dataloader)
                     eval_loss = eval_metrics.get('eval_loss', float('inf'))
                     perplexity = eval_metrics.get('perplexity', float('inf'))
@@ -641,23 +671,16 @@ class AdvancedNagatoSakuraTrainer:
                     self.training_history['eval_loss'].append(eval_loss)
                     self.training_history['perplexity'].append(perplexity)
                     
-                    self.logger.info(f"評估結果 - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
-                    
-                    # WandB記錄
-                    if self.use_wandb:
-                        wandb.log({
-                            "epoch": epoch + 1,
-                            "train/epoch_loss": epoch_loss,
-                            "eval/loss": eval_loss,
-                            "eval/perplexity": perplexity
-                        })
+                    if should_log_details:
+                        self.logger.info(f"評估結果 - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
                     
                     # 檢查是否是最佳模型
                     if eval_loss < self.best_eval_loss:
                         self.best_eval_loss = eval_loss
                         is_best = True
                         should_save_checkpoint = True
-                        self.logger.info(f"🎉 新的最佳模型! 評估損失: {eval_loss:.4f}")
+                        if should_log_details:
+                            self.logger.info(f"🎉 新的最佳模型! 評估損失: {eval_loss:.4f}")
                     
                     # 早停檢查
                     if self.early_stopping and self.early_stopping(eval_loss):
@@ -667,6 +690,19 @@ class AdvancedNagatoSakuraTrainer:
                             optimizer, scheduler, scaler, False
                         )
                         break
+                
+                # WandB記錄（總是記錄基本信息）
+                if self.use_wandb:
+                    log_data = {
+                        "epoch": epoch + 1,
+                        "train/epoch_loss": epoch_loss
+                    }
+                    if eval_loss is not None:
+                        log_data.update({
+                            "eval/loss": eval_loss,
+                            "eval/perplexity": perplexity
+                        })
+                    wandb.log(log_data)
                 
                 # 檢查是否需要保存checkpoint
                 if (epoch + 1) % save_interval_epochs == 0:

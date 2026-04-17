@@ -1,10 +1,67 @@
 import torch
 import logging
-from typing import List, Dict, Any, Optional, Tuple, Iterator
+from typing import List, Dict, Any, Optional, Tuple, Iterator, Union
 from transformers import PreTrainedTokenizerFast
 from dataclasses import dataclass
 import json
 import time
+
+
+def _tokenize_batch_with_fallback(
+    tokenizer: PreTrainedTokenizerFast,
+    texts: List[str],
+    max_seq_length: int,
+    padding: Union[bool, str] = "longest"
+) -> Dict[str, torch.Tensor]:
+    """批次編碼相容層：優先使用 tokenizer(...)，失敗時退回手動編碼。"""
+    try:
+        return tokenizer(
+            texts,
+            padding=padding,
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+    except Exception:
+        # 某些 tokenizers 後端不支援批次 API，改用逐筆 encode + 手動 padding。
+        encoded_sequences = []
+        for text in texts:
+            token_ids = tokenizer.encode(str(text), add_special_tokens=False)
+            if max_seq_length and len(token_ids) > max_seq_length:
+                token_ids = token_ids[:max_seq_length]
+            encoded_sequences.append(token_ids)
+
+        if not encoded_sequences:
+            return {
+                "input_ids": torch.empty((0, 0), dtype=torch.long),
+                "attention_mask": torch.empty((0, 0), dtype=torch.long),
+            }
+
+        if padding in (True, "longest"):
+            target_len = max(len(ids) for ids in encoded_sequences)
+        elif padding == "max_length":
+            target_len = max_seq_length
+        else:
+            target_len = max(len(ids) for ids in encoded_sequences)
+
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("分詞器缺少 pad_token_id 與 eos_token_id")
+
+        padded_ids = []
+        attention_masks = []
+        for ids in encoded_sequences:
+            pad_len = max(0, target_len - len(ids))
+            padded_ids.append(ids + [pad_token_id] * pad_len)
+            attention_masks.append([1] * len(ids) + [0] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(padded_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
+        }
 
 @dataclass
 class ConversationSample:
@@ -129,13 +186,11 @@ def smart_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizer
     
     try:
         # 編碼批次
-        encoded_batch = tokenizer.batch_encode_plus(
-            full_texts,
-            padding="longest",
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt",
-            return_attention_mask=True
+        encoded_batch = _tokenize_batch_with_fallback(
+            tokenizer=tokenizer,
+            texts=full_texts,
+            max_seq_length=max_seq_length,
+            padding="longest"
         )
         
         input_ids = encoded_batch["input_ids"]
@@ -178,13 +233,11 @@ def stream_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenize
     if not texts:
         return {"input_ids": torch.empty(0, 0, dtype=torch.long)}
     
-    encoded = tokenizer.batch_encode_plus(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_seq_length,
-        return_tensors="pt",
-        return_attention_mask=True
+    encoded = _tokenize_batch_with_fallback(
+        tokenizer=tokenizer,
+        texts=texts,
+        max_seq_length=max_seq_length,
+        padding=True
     )
     
     return encoded

@@ -27,35 +27,33 @@ def main():
     
     # 數據相關
     parser.add_argument("--training_data_file", type=str, default="generated_data/all.json", help="訓練數據文件路徑")
-    parser.add_argument("--output_dir", type=str, default="NS-LLM", help="輸出目錄")
+    parser.add_argument("--output_dir", type=str, default="NS-LLM-4096", help="輸出目錄")
     parser.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
-    parser.add_argument("--eval_split_ratio", type=float, default=0, help="評估集分割比例")
+    parser.add_argument("--eval_split_ratio", type=float, default=0.05, help="評估集分割比例")
     
     # 模型配置
-    parser.add_argument("--vocab_size", type=int, default=32768, help="詞彙表大小")
+    parser.add_argument("--vocab_size", type=int, default=65536, help="詞彙表大小")
     parser.add_argument("--hidden_size", type=int, default=1024, help="隱藏層大小")
     parser.add_argument("--num_layers", type=int, default=16, help="層數")
     parser.add_argument("--num_heads", type=int, default=16, help="注意力頭數")
     parser.add_argument("--intermediate_size", type=int, default=4096, help="MLP中間層大小")
-    parser.add_argument("--max_seq_length", type=int, default=1024, help="最大序列長度")
-    parser.add_argument("--memory_tokens", type=int, default=0, help="記憶令牌數量")
+    parser.add_argument("--max_seq_length", type=int, default=4096, help="最大序列長度")
+    parser.add_argument("--memory_tokens", type=int, default=32, help="記憶令牌數量")
     
     # 訓練參數
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=32, help="梯度累積步數")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="梯度累積步數")
     parser.add_argument("--num_epochs", type=int, default=1000, help="訓練輪數")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="學習率")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="權重衰減")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
-    parser.add_argument("--warmup_ratio", type=float, default=0, help="預熱比例")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="預熱比例")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪閾值")
     
     # 日誌和檢查點
-    parser.add_argument("--log_interval", type=int, default=50, help="日誌記錄間隔")
-    parser.add_argument("--save_interval_steps", type=int, default=500, help="按步數保存間隔")
-    parser.add_argument("--save_interval_epochs", type=int, default=1, help="按epoch保存間隔")
-    parser.add_argument("--eval_interval_steps", type=int, default=500, help="評估間隔")
-    parser.add_argument("--early_stopping_patience", type=int, default=50, help="早停耐心值")
+    parser.add_argument("--log_interval", type=int, default=1, help="日誌記錄間隔（按epoch）")
+    parser.add_argument("--save_interval_epochs", type=int, default=5, help="按epoch保存間隔")
+    parser.add_argument("--early_stopping_patience", type=int, default=50, help="早停耐心值（按epoch）")
     parser.add_argument("--no_resume", action="store_true", help="不從檢查點恢復")
     
     # 其他
@@ -124,9 +122,7 @@ def main():
             warmup_ratio=args.warmup_ratio,
             max_grad_norm=args.max_grad_norm,
             log_interval=args.log_interval,
-            save_interval_steps=args.save_interval_steps,
             save_interval_epochs=args.save_interval_epochs,
-            eval_interval_steps=args.eval_interval_steps,
             early_stopping_patience=args.early_stopping_patience,
             resume_from_checkpoint=not args.no_resume
         )

@@ -592,11 +592,19 @@ class GenerationSampler:
         
     def _get_deterministic_generator(self, seed: int, step: int, device: torch.device) -> torch.Generator:
         """獲取確定性的隨機數生成器（修復設備問題）"""
-        generator = torch.Generator(device=device)  # 指定設備
-        # 使用種子和步驟創建確定性序列
-        combined_seed = (seed * 31 + step) % (2**32)
-        generator.manual_seed(combined_seed)
-        return generator
+        try:
+            generator = torch.Generator(device=device)  # 確保生成器在正確設備上
+            # 使用種子和步驟創建確定性序列
+            combined_seed = (seed * 31 + step) % (2**32)
+            generator.manual_seed(combined_seed)
+            return generator
+        except Exception as e:
+            # 如果設備特定的生成器失敗，回退到CPU生成器
+            logger.warning(f"創建設備特定生成器失敗: {e}，使用CPU生成器")
+            generator = torch.Generator()
+            combined_seed = (seed * 31 + step) % (2**32)
+            generator.manual_seed(combined_seed)
+            return generator
     
     def set_generation_state(self, seed: Optional[int] = None, reset_stats: bool = False):
         """設置生成狀態，確保可重現性"""
@@ -604,6 +612,7 @@ class GenerationSampler:
             import time
             seed = int(time.time() * 1000) % (2**32)
         
+        # 完全重置生成狀態
         self._generation_state = {
             'seed': seed,
             'step': 0,
@@ -618,7 +627,7 @@ class GenerationSampler:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
             
-        logger.debug(f"生成狀態設置 - 種子: {seed}")
+        logger.debug(f"生成狀態設置 - 種子: {seed}, 步驟重置為: 0")
     
     def apply_sampling(
         self,
@@ -720,16 +729,34 @@ class GenerationSampler:
         # 使用確定性生成器進行採樣（修復設備問題）
         try:
             if self._generation_state is not None:
+                # 確保每次都使用正確的步驟計數
+                current_step = self._generation_state['step']
                 generator = self._get_deterministic_generator(
                     self._generation_state['seed'], 
-                    self._generation_state['step'],
-                    self._device  # 傳遞正確的設備
+                    current_step,
+                    self._device or logits.device  # 使用正確的設備
                 )
-                self._generation_state['step'] += 1
+                # 立即更新步驟計數
+                self._generation_state['step'] = current_step + 1
                 
-                next_token = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+                # 確保 probs 在正確的設備上
+                if probs.device != logits.device:
+                    probs = probs.to(logits.device)
+                
+                try:
+                    next_token = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+                    logger.debug(f"採樣步驟 {current_step}, 種子 {self._generation_state['seed']}, token: {next_token.item()}")
+                except RuntimeError as e:
+                    # 如果設備生成器失敗，嘗試不使用生成器但仍要確保種子一致性
+                    logger.warning(f"設備生成器採樣失敗: {e}，使用全局種子採樣")
+                    # 重新設置全局種子以確保一致性
+                    combined_seed = (self._generation_state['seed'] * 31 + current_step) % (2**32)
+                    torch.manual_seed(combined_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(combined_seed)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
             else:
-                # 如果沒有生成狀態，直接採樣（確保在正確設備上）
+                # 如果沒有生成狀態，直接採樣
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 
         except RuntimeError as e:
@@ -1343,8 +1370,8 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 確保模型處於評估模式
         self.eval()
         
-        # 設置生成狀態以確保一致性
-        self.sampler.set_generation_state(generation_seed)
+        # 設置生成狀態以確保一致性 - 完全重置狀態
+        self.sampler.set_generation_state(generation_seed, reset_stats=True)
 
         # 獲取配置中的默認值
         pad_token_id = pad_token_id or getattr(self.config, 'pad_token_id', None)
@@ -1444,15 +1471,15 @@ class NagatoSakuraForCausalLM(nn.Module):
         stop_strings: Optional[List[str]] = None,
         **kwargs
     ) -> Iterator[Dict[str, Any]]:
-        """流式生成，與generate()使用完全相同的邏輯確保一致性"""
+        """簡化的流式生成，確保穩定性"""
         if input_ids is None:
             raise ValueError("input_ids 不能為 None")
         
         # 確保模型處於評估模式
         self.eval()
-        
-        # 設置相同的生成狀態確保一致性
-        self.sampler.set_generation_state(generation_seed)
+
+        # 與非流式生成保持一致的種子與採樣狀態
+        self.sampler.set_generation_state(generation_seed, reset_stats=True)
         
         # 初始化
         batch_size, input_length = input_ids.shape
@@ -1470,42 +1497,28 @@ class NagatoSakuraForCausalLM(nn.Module):
         generated_ids = input_ids.clone()
         past_key_values = None
         tokens_generated = 0
-        should_stop = False
         
-        # 初始狀態輸出
-        yield {
-            "token_id": None,
-            "token_text": "",
-            "generated_text": "",
-            "finished": False,
-            "stop_reason": None,
-            "tokens_generated": 0,
-            "input_length": input_length,
-            "generated_ids": generated_ids.clone()
-        }
-        
-        # 生成循環 - 與generate()使用完全相同邏輯
+        # 生成循環
         for step in range(max_new_tokens):
             try:
-                # 準備當前步驟的輸入
+                # 準備輸入
                 current_input_ids = generated_ids if past_key_values is None else generated_ids[:, -1:]
-                current_attention_mask = attention_mask if past_key_values is None else torch.cat([
-                    attention_mask, torch.ones((batch_size, 1), device=device)
-                ], dim=1)
+                current_attention_mask = attention_mask
                 
                 # 前向傳播
-                outputs = self(
-                    input_ids=current_input_ids,
-                    attention_mask=current_attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=True
-                )
+                with torch.no_grad():
+                    outputs = self(
+                        input_ids=current_input_ids,
+                        attention_mask=current_attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True
+                    )
                 
                 logits = outputs.logits[:, -1, :]  # 取最後一個位置的logits
                 past_key_values = outputs.past_key_values
-                
-                # 應用相同的採樣邏輯
-                next_token = self.sampler.apply_sampling(
+
+                # 與 generate 共用統一採樣邏輯，確保 top_p / repetition_penalty 一致生效
+                next_tokens = self.sampler.apply_sampling(
                     logits=logits,
                     temperature=temperature,
                     top_k=top_k,
@@ -1515,12 +1528,10 @@ class NagatoSakuraForCausalLM(nn.Module):
                     input_length=input_length,
                     do_sample=do_sample
                 )
-                
-                if next_token is None or next_token.dim() == 0:
-                    next_token = next_token.unsqueeze(0) if next_token is not None else torch.tensor([eos_token_id or 0], device=device)
+                next_token = next_tokens.unsqueeze(-1)
                 
                 # 更新生成序列
-                generated_ids = torch.cat([generated_ids, next_token.unsqueeze(0)], dim=1)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
                 tokens_generated += 1
                 
                 # 更新注意力掩碼
@@ -1530,33 +1541,20 @@ class NagatoSakuraForCausalLM(nn.Module):
                 
                 # 檢查停止條件
                 stop_reason = None
-                if next_token.item() == eos_token_id:
+                should_stop = False
+                
+                if eos_token_id is not None and next_token.item() == eos_token_id:
                     should_stop = True
                     stop_reason = "eos_token"
                 elif tokens_generated >= max_new_tokens:
                     should_stop = True
                     stop_reason = "max_length"
-                elif tokens_generated < min_new_tokens:
-                    should_stop = False
-                
-                # 解碼新token
-                try:
-                    new_token_text = self.get_decoder().get_input_embeddings().weight.shape[0]  # 檢查詞彙表大小
-                    if 0 <= next_token.item() < new_token_text:
-                        # 解碼單個token
-                        new_token_text = self.config.vocab_size  # 臨時解決方案
-                        # 這裡需要實際的tokenizer來解碼
-                        new_token_text = ""  # 暫時設為空字符串
-                    else:
-                        new_token_text = ""
-                except Exception:
-                    new_token_text = ""
                 
                 # 輸出當前狀態
                 yield {
                     "token_id": next_token.item(),
-                    "token_text": new_token_text,
-                    "generated_text": "",  # 需要完整解碼
+                    "token_text": "",  # 由上層tokenizer處理
+                    "generated_text": "",  # 由上層tokenizer處理
                     "finished": should_stop,
                     "stop_reason": stop_reason if should_stop else None,
                     "tokens_generated": tokens_generated,
@@ -1580,18 +1578,6 @@ class NagatoSakuraForCausalLM(nn.Module):
                     "generated_ids": generated_ids.clone()
                 }
                 break
-        
-        # 確保最終狀態被標記為完成
-        if not should_stop:
-            yield {
-                "token_id": None,
-                "token_text": "",
-                "generated_text": "",
-                "finished": True,
-                "stop_reason": "max_length",
-                "tokens_generated": tokens_generated,
-                "generated_ids": generated_ids.clone()
-            }
 
     def chat_stream(
         self,
