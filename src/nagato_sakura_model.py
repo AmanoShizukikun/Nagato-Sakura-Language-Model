@@ -12,6 +12,27 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+try:
+    from .kv_cache import (
+        CacheEntryLike,
+        KVCacheEntry,
+        KVQuantizationConfig,
+        cache_seq_len,
+        quantize_kv_pair,
+        restore_kv_pair,
+    )
+except ImportError:
+    from kv_cache import (  # type: ignore
+        CacheEntryLike,
+        KVCacheEntry,
+        KVQuantizationConfig,
+        cache_seq_len,
+        quantize_kv_pair,
+        restore_kv_pair,
+    )
+
+PastKeyValue = CacheEntryLike
+
 # 檢查 PyTorch 版本以支援 SDPA
 TORCH_VERSION = tuple(map(int, torch.__version__.split('.')[:2]))
 SDPA_AVAILABLE = TORCH_VERSION >= (2, 0)
@@ -23,7 +44,7 @@ if SDPA_AVAILABLE:
 class NagatoSakuraOutput:
     last_hidden_state: torch.FloatTensor
     logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+    past_key_values: Optional[List[PastKeyValue]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     loss: Optional[torch.FloatTensor] = None
@@ -220,6 +241,12 @@ class NSAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(min(config.attention_dropout, 0.1))
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.kv_quant_config = KVQuantizationConfig(
+            enabled=getattr(config, "quantize_kv_cache", False),
+            kv_bits=getattr(config, "kv_cache_bits", 32),
+            group_size=getattr(config, "kv_quant_group_size", 64),
+            use_residual_sign=getattr(config, "kv_residual_sign_correction", False),
+        )
 
     def _sdpa_attention_forward(
         self,
@@ -269,10 +296,10 @@ class NSAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[PastKeyValue] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PastKeyValue]]:
         bsz, q_len, _ = hidden_states.size()
 
         # 投影到 Q, K, V
@@ -288,8 +315,14 @@ class NSAttention(nn.Module):
         # 計算序列長度
         kv_seq_len = key_states.shape[-2]
         past_kv_len = 0
+        past_key_states = None
+        past_value_states = None
         if past_key_value is not None:
-            past_kv_len = past_key_value[0].shape[-2]
+            past_key_states, past_value_states = restore_kv_pair(
+                past_key_value,
+                target_dtype=key_states.dtype,
+            )
+            past_kv_len = past_key_states.shape[-2]
             kv_seq_len += past_kv_len
 
         # 應用 RoPE
@@ -313,11 +346,11 @@ class NSAttention(nn.Module):
             logger.warning(f"RoPE應用失敗，跳過: {e}")
 
         # 處理過去的鍵值對
-        if past_key_value is not None:
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        if past_key_states is not None and past_value_states is not None:
+            key_states = torch.cat([past_key_states, key_states], dim=2)
+            value_states = torch.cat([past_value_states, value_states], dim=2)
 
-        present_key_value = (key_states, value_states) if use_cache else None
+        present_key_value = quantize_kv_pair(key_states, value_states, self.kv_quant_config) if use_cache else None
 
         # 分組查詢注意力：重複 key 和 value
         if self.num_key_value_groups > 1:
@@ -396,10 +429,10 @@ class NSDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[PastKeyValue] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[PastKeyValue]]:
         residual = hidden_states
 
         # Pre-Norm 注意力
@@ -484,6 +517,10 @@ class NSConfig:
     # 記憶體優化
     use_cache: bool = True
     gradient_checkpointing: bool = False
+    quantize_kv_cache: bool = False
+    kv_cache_bits: int = 32
+    kv_quant_group_size: int = 64
+    kv_residual_sign_correction: bool = False
     
     def __post_init__(self):
         """後初始化處理"""
@@ -497,6 +534,13 @@ class NSConfig:
                 f"num_attention_heads ({self.num_attention_heads}) 必須是 "
                 f"num_key_value_heads ({self.num_key_value_heads}) 的倍數"
             )
+
+        supported_bits = {3, 4, 8, 16, 32}
+        if self.kv_cache_bits not in supported_bits:
+            raise ValueError(f"kv_cache_bits 必須是 {sorted(supported_bits)} 之一，收到: {self.kv_cache_bits}")
+
+        if self.kv_quant_group_size <= 0:
+            raise ValueError("kv_quant_group_size 必須大於 0")
         
         # 調整中間層大小（通常是 hidden_size 的 2.7 倍）
         if self.intermediate_size <= self.hidden_size:
@@ -980,7 +1024,7 @@ class NagatoSakuraModel(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[PastKeyValue]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1024,8 +1068,8 @@ class NagatoSakuraModel(nn.Module):
         past_key_values_length = 0
         if past_key_values is not None and len(past_key_values) > 0:
             try:
-                past_key_values_length = past_key_values[0][0].shape[2]
-            except (IndexError, AttributeError):
+                past_key_values_length = cache_seq_len(past_key_values[0])
+            except (IndexError, AttributeError, ValueError):
                 logger.warning("past_key_values 格式異常，忽略")
                 past_key_values = None
 
@@ -1184,9 +1228,20 @@ class NagatoSakuraModel(nn.Module):
         # KV緩存記憶體（如果使用）
         kv_cache_memory = 0
         if self.config.use_cache:
+            kv_bits = getattr(self.config, "kv_cache_bits", 32)
+            bytes_per_value = 4.0
+            if kv_bits == 16:
+                bytes_per_value = 2.0
+            elif kv_bits == 8:
+                bytes_per_value = 1.0
+            elif kv_bits == 4:
+                bytes_per_value = 0.5
+            elif kv_bits == 3:
+                bytes_per_value = 0.375
+
             kv_cache_memory = (
                 2 * batch_size * self.config.num_key_value_heads * seq_length * 
-                (hidden_size // self.config.num_attention_heads) * num_layers * 4 / 1024**3
+                (hidden_size // self.config.num_attention_heads) * num_layers * bytes_per_value / 1024**3
             )
         
         return {
@@ -1264,7 +1319,7 @@ class NagatoSakuraForCausalLM(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[PastKeyValue]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
@@ -1306,7 +1361,7 @@ class NagatoSakuraForCausalLM(nn.Module):
         return outputs
 
     def prepare_inputs_for_generation(
-        self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, 
+        self, input_ids: torch.LongTensor, past_key_values: Optional[List[PastKeyValue]] = None,
         attention_mask: Optional[torch.Tensor] = None, inputs_embeds: Optional[torch.FloatTensor] = None, **kwargs
     ) -> Dict[str, Any]:
         """為生成準備輸入"""
@@ -1336,13 +1391,22 @@ class NagatoSakuraForCausalLM(nn.Module):
         return model_inputs
 
     @staticmethod
-    def _reorder_cache(past_key_values: List[Tuple[torch.Tensor, torch.Tensor]], beam_idx: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    def _reorder_cache(past_key_values: List[PastKeyValue], beam_idx: torch.Tensor) -> List[PastKeyValue]:
         """重新排序緩存以支持束搜索"""
         reordered_past = []
         for layer_past in past_key_values:
-            reordered_past.append(
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past)
-            )
+            if isinstance(layer_past, KVCacheEntry):
+                key_states, value_states = layer_past.as_tensors(target_dtype=torch.float32)
+                reordered_past.append(
+                    (
+                        key_states.index_select(0, beam_idx),
+                        value_states.index_select(0, beam_idx),
+                    )
+                )
+            else:
+                reordered_past.append(
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past)
+                )
         return reordered_past
 
     @torch.no_grad()

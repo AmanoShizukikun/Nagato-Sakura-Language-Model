@@ -122,6 +122,10 @@ class AdvancedNagatoSakuraTrainer:
             
             # 綁定權重
             self.model.tie_weights()
+
+            if getattr(self.model_config, "gradient_checkpointing", False):
+                self.model.model.enable_gradient_checkpointing()
+                self.logger.info("已根據配置啟用梯度檢查點")
             
             if self.use_wandb:
                 wandb.config.update({
@@ -326,7 +330,8 @@ class AdvancedNagatoSakuraTrainer:
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    labels=labels
+                    labels=labels,
+                    use_cache=False,
                 )
                 loss = outputs.loss
             
@@ -461,7 +466,8 @@ class AdvancedNagatoSakuraTrainer:
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels
+                        labels=labels,
+                        use_cache=False,
                     )
                     loss = outputs.loss
                 

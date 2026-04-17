@@ -27,7 +27,7 @@ def main():
     
     # 數據相關
     parser.add_argument("--training_data_file", type=str, default="generated_data/all.json", help="訓練數據文件路徑")
-    parser.add_argument("--output_dir", type=str, default="NS-LLM-4096", help="輸出目錄")
+    parser.add_argument("--output_dir", type=str, default="NS-LLM-0.5", help="輸出目錄")
     parser.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
     parser.add_argument("--eval_split_ratio", type=float, default=0.05, help="評估集分割比例")
     
@@ -36,9 +36,14 @@ def main():
     parser.add_argument("--hidden_size", type=int, default=1024, help="隱藏層大小")
     parser.add_argument("--num_layers", type=int, default=16, help="層數")
     parser.add_argument("--num_heads", type=int, default=16, help="注意力頭數")
+    parser.add_argument("--num_key_value_heads", type=int, default=8, help="GQA 的 key/value 頭數")
     parser.add_argument("--intermediate_size", type=int, default=4096, help="MLP中間層大小")
     parser.add_argument("--max_seq_length", type=int, default=4096, help="最大序列長度")
     parser.add_argument("--memory_tokens", type=int, default=32, help="記憶令牌數量")
+    parser.add_argument("--quantize_kv_cache", action="store_true", help="啟用 KV cache 量化")
+    parser.add_argument("--kv_cache_bits", type=int, default=4, choices=[3, 4, 8, 16, 32], help="KV cache 位寬")
+    parser.add_argument("--kv_quant_group_size", type=int, default=64, help="KV 量化分組大小")
+    parser.add_argument("--kv_residual_sign_correction", action="store_true", help="啟用 1-bit 殘差符號修正")
     
     # 訓練參數
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")
@@ -49,6 +54,7 @@ def main():
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
     parser.add_argument("--warmup_ratio", type=float, default=0.05, help="預熱比例")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪閾值")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="啟用梯度檢查點")
     
     # 日誌和檢查點
     parser.add_argument("--log_interval", type=int, default=1, help="日誌記錄間隔（按epoch）")
@@ -88,6 +94,7 @@ def main():
             intermediate_size=args.intermediate_size,
             num_hidden_layers=args.num_layers,
             num_attention_heads=args.num_heads,
+            num_key_value_heads=args.num_key_value_heads,
             max_position_embeddings=args.max_seq_length,
             memory_tokens=args.memory_tokens,
             pad_token_id=trainer.tokenizer_manager.transformers_tokenizer.pad_token_id,
@@ -97,7 +104,12 @@ def main():
             rope_theta=10000.0,
             rms_norm_eps=1e-6,
             hidden_dropout=0.05,
-            attention_dropout=0.05
+            attention_dropout=0.05,
+            gradient_checkpointing=args.gradient_checkpointing,
+            quantize_kv_cache=args.quantize_kv_cache,
+            kv_cache_bits=args.kv_cache_bits,
+            kv_quant_group_size=args.kv_quant_group_size,
+            kv_residual_sign_correction=args.kv_residual_sign_correction,
         )
         
         trainer.model_config = model_config

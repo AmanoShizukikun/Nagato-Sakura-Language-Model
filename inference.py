@@ -39,6 +39,11 @@ class InferenceConfig:
     do_sample: bool = True
     base_seed: int = -1
     silent_mode: bool = True  # 靜默模式，不顯示內存監控信息
+    quantize_kv_cache: Optional[bool] = None
+    kv_cache_bits: Optional[int] = None
+    kv_quant_group_size: Optional[int] = None
+    kv_residual_sign_correction: Optional[bool] = None
+    num_key_value_heads: Optional[int] = None
 
 class ColoredFormatter(logging.Formatter):
     """彩色日誌格式器"""
@@ -134,6 +139,18 @@ class NagatoSakuraInference:
             model_config.pad_token_id = self.tokenizer.pad_token_id
             model_config.bos_token_id = self.tokenizer.bos_token_id
             model_config.eos_token_id = self.tokenizer.eos_token_id
+
+            # 套用命令列覆寫（0.5.0）
+            if self.config.num_key_value_heads is not None:
+                model_config.num_key_value_heads = self.config.num_key_value_heads
+            if self.config.quantize_kv_cache is not None:
+                model_config.quantize_kv_cache = self.config.quantize_kv_cache
+            if self.config.kv_cache_bits is not None:
+                model_config.kv_cache_bits = self.config.kv_cache_bits
+            if self.config.kv_quant_group_size is not None:
+                model_config.kv_quant_group_size = self.config.kv_quant_group_size
+            if self.config.kv_residual_sign_correction is not None:
+                model_config.kv_residual_sign_correction = self.config.kv_residual_sign_correction
             
             # 創建模型
             self.logger.info(f"加載模型: {self.config.model_path}")
@@ -436,6 +453,11 @@ class NagatoSakuraInference:
 - 採樣: {self.config.do_sample}
 - 設備: {self.device}
 - 基礎種子: {self.seed_manager.base_seed}
+- KV量化: {self.config.quantize_kv_cache if self.config.quantize_kv_cache is not None else '依模型配置'}
+- KV位寬: {self.config.kv_cache_bits if self.config.kv_cache_bits is not None else '依模型配置'}
+- KV分組: {self.config.kv_quant_group_size if self.config.kv_quant_group_size is not None else '依模型配置'}
+- 殘差符號修正: {self.config.kv_residual_sign_correction if self.config.kv_residual_sign_correction is not None else '依模型配置'}
+- num_key_value_heads: {self.config.num_key_value_heads if self.config.num_key_value_heads is not None else '依模型配置'}
 - 靜默模式: {'開啟' if self.config.silent_mode else '關閉'}
 - 隨機種子模式: 每次對話使用不同種子
 """)
@@ -586,7 +608,7 @@ def main():
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-4096/checkpoint-epoch-13", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-0.5/checkpoint-epoch-10", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式
@@ -604,6 +626,13 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p參數")
     parser.add_argument("--repetition_penalty", type=float, default=1.1, help="重複懲罰")
     parser.add_argument("--no_sample", action="store_true", help="禁用採樣（使用貪婪解碼）")
+
+    # 0.5.0 量化/架構覆寫
+    parser.add_argument("--quantize_kv_cache", action="store_true", help="啟用 KV cache 量化")
+    parser.add_argument("--kv_cache_bits", type=int, choices=[3, 4, 8, 16, 32], help="KV cache 位寬")
+    parser.add_argument("--kv_quant_group_size", type=int, help="KV 量化分組大小")
+    parser.add_argument("--kv_residual_sign_correction", action="store_true", help="啟用 1-bit 殘差符號修正")
+    parser.add_argument("--num_key_value_heads", type=int, help="覆寫 GQA key/value 頭數")
     
     # 種子控制
     parser.add_argument("--seed", type=int, default=-1, help="基礎種子（-1為隨機種子）")
@@ -643,7 +672,12 @@ def main():
             repetition_penalty=args.repetition_penalty,
             do_sample=not args.no_sample,
             base_seed=args.seed,
-            silent_mode=not args.verbose  # 默認靜默模式，除非用戶指定verbose
+            silent_mode=not args.verbose,  # 默認靜默模式，除非用戶指定verbose
+            quantize_kv_cache=args.quantize_kv_cache if args.quantize_kv_cache else None,
+            kv_cache_bits=args.kv_cache_bits,
+            kv_quant_group_size=args.kv_quant_group_size,
+            kv_residual_sign_correction=(True if args.kv_residual_sign_correction else None),
+            num_key_value_heads=args.num_key_value_heads,
         )
         
         # 創建推理器
