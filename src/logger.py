@@ -11,6 +11,7 @@ from datetime import datetime
 
 import torch
 import psutil
+from tqdm import tqdm
 try:
     import GPUtil
 except ImportError:
@@ -33,6 +34,18 @@ class ColoredFormatter(logging.Formatter):
         log_color = self.COLORS.get(record.levelname, self.RESET)
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)
+
+
+class TqdmConsoleHandler(logging.StreamHandler):
+    """使用 tqdm.write 輸出，避免日誌破壞進度條。"""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=self.stream)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging(output_dir: str, log_level: str = "INFO"):
@@ -59,8 +72,8 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
     
-    # 控制台處理器（彩色）
-    console_handler = logging.StreamHandler(sys.stdout)
+    # 控制台處理器（彩色 + tqdm相容）
+    console_handler = TqdmConsoleHandler(sys.stdout)
     console_formatter = ColoredFormatter(
         '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%H:%M:%S'

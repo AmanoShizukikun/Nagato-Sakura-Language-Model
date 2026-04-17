@@ -185,6 +185,7 @@ class AdvancedNagatoSakuraTrainer:
         self.eval_medium_max_tokens = 256
         self._scheduler_total_steps: Optional[int] = None
         self._scheduler_warmup_steps: Optional[int] = None
+        self._scheduler_step_offset: int = 0
         best_model_dir = self.output_dir / "best_model"
         if (best_model_dir / "model.pt").exists():
             self.best_checkpoint_path = best_model_dir
@@ -402,8 +403,66 @@ class AdvancedNagatoSakuraTrainer:
 
         return None
 
+    def _set_scheduler_step_offset(self, raw_offset: int, source: str) -> int:
+        offset = int(raw_offset)
+        if offset in (-1, 0):
+            self._scheduler_step_offset = offset
+            return self._scheduler_step_offset
+
+        normalized = 0 if offset >= 0 else -1
+        self.logger.warning(
+            f"偵測到非常規 scheduler step offset({offset})，來源={source}，"
+            f"已正規化為 {normalized}"
+        )
+        self._scheduler_step_offset = normalized
+        return self._scheduler_step_offset
+
+    def _refresh_scheduler_step_offset(self, scheduler, source: str) -> int:
+        scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -1))
+        inferred_offset = scheduler_last_epoch - int(self.global_step)
+        return self._set_scheduler_step_offset(inferred_offset, source=source)
+
+    def _expected_scheduler_last_epoch(self) -> int:
+        return max(-1, int(self.global_step) + int(self._scheduler_step_offset))
+
+    def _apply_resume_lr_scale(self, optimizer, scheduler, scale: float, reason: str) -> None:
+        scale_value = float(scale)
+        if not math.isfinite(scale_value) or scale_value <= 0.0:
+            raise ValueError(f"resume_lr_scale 必須是正且有限數值，收到: {scale}")
+        if abs(scale_value - 1.0) < 1e-12:
+            return
+
+        updated_lrs: List[float] = []
+        for group in optimizer.param_groups:
+            if "lr" in group:
+                group["lr"] = float(group["lr"]) * scale_value
+                updated_lrs.append(float(group["lr"]))
+            if "initial_lr" in group:
+                group["initial_lr"] = float(group["initial_lr"]) * scale_value
+
+        if hasattr(scheduler, "base_lrs") and isinstance(getattr(scheduler, "base_lrs"), list):
+            scheduler.base_lrs = [float(lr) * scale_value for lr in scheduler.base_lrs]
+
+        if hasattr(scheduler, "_last_lr") and isinstance(getattr(scheduler, "_last_lr"), list):
+            scheduler._last_lr = [float(lr) * scale_value for lr in scheduler._last_lr]
+
+        lr_display = "n/a"
+        if updated_lrs:
+            lr_display = f"{updated_lrs[0]:.2e}"
+        self.logger.info(
+            f"已套用續訓學習率縮放({reason}) - scale={scale_value:.6f}, current_lr={lr_display}"
+        )
+
+    @staticmethod
+    def _get_optimizer_lr(optimizer) -> Optional[float]:
+        for group in optimizer.param_groups:
+            lr_value = group.get("lr")
+            if isinstance(lr_value, (int, float)) and math.isfinite(float(lr_value)):
+                return float(lr_value)
+        return None
+
     def _align_scheduler_to_global_step(self, scheduler, reason: str) -> None:
-        target_last_epoch = max(-1, int(self.global_step) - 1)
+        target_last_epoch = self._expected_scheduler_last_epoch()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -449,7 +508,7 @@ class AdvancedNagatoSakuraTrainer:
             self.logger.warning(f"學習率調度器對齊失敗({reason}): {e}")
 
     def _verify_scheduler_alignment(self, scheduler) -> None:
-        expected_last_epoch = max(-1, int(self.global_step) - 1)
+        expected_last_epoch = self._expected_scheduler_last_epoch()
         actual_last_epoch = int(getattr(scheduler, "last_epoch", -1))
         if actual_last_epoch != expected_last_epoch:
             self.logger.warning(
@@ -754,6 +813,7 @@ class AdvancedNagatoSakuraTrainer:
         data_list: List[Dict[str, str]],
         eval_split_ratio: float = 0.01,
         fixed_eval_data: Optional[List[Dict[str, str]]] = None,
+        enable_pretokenize: bool = True,
         pretokenize_batch_size: int = 1024,
         pretokenize_num_proc: Optional[int] = None,
         use_pretokenize_cache: bool = True,
@@ -769,6 +829,38 @@ class AdvancedNagatoSakuraTrainer:
             raise ValueError("分詞器尚未初始化")
         if self.model_config is None:
             raise ValueError("模型配置尚未初始化")
+
+        if not bool(enable_pretokenize):
+            self.logger.info("Pretokenize 設定 - 停用（改為訓練時即時分詞）")
+            if fixed_eval_data is not None:
+                if not fixed_eval_data:
+                    raise ValueError("固定評估集為空，請檢查 eval_data_file")
+                if eval_split_ratio > 0:
+                    self.logger.warning("已提供固定評估集，將忽略 eval_split_ratio")
+
+                train_dataset = Dataset.from_list(data_list)
+                eval_dataset = Dataset.from_list(fixed_eval_data)
+                self.logger.info(
+                    f"使用固定評估集(即時分詞) - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
+                )
+                return train_dataset, eval_dataset
+
+            dataset = Dataset.from_list(data_list)
+            if eval_split_ratio > 0 and eval_split_ratio < 1.0 and len(dataset) > 1:
+                split_datasets = dataset.train_test_split(
+                    test_size=eval_split_ratio,
+                    shuffle=True,
+                    seed=42,
+                )
+                train_dataset = split_datasets["train"]
+                eval_dataset = split_datasets["test"]
+                self.logger.info(
+                    f"數據集分割完成(即時分詞) - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
+                )
+                return train_dataset, eval_dataset
+
+            self.logger.info(f"使用完整數據集進行訓練(即時分詞): {len(dataset)}")
+            return dataset, None
 
         tokenizer = self.tokenizer_manager.transformers_tokenizer
         max_seq_length = self.model_config.max_position_embeddings
@@ -949,7 +1041,11 @@ class AdvancedNagatoSakuraTrainer:
         
         # 學習率調度器
         effective_epochs = max(1, int(scheduler_target_epochs or num_epochs))
-        total_steps = max(1, len(train_dataloader) // max(1, gradient_accumulation_steps) * effective_epochs)
+        updates_per_epoch = max(
+            1,
+            int(math.ceil(len(train_dataloader) / max(1, gradient_accumulation_steps))),
+        )
+        total_steps = max(1, updates_per_epoch * effective_epochs)
         warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0 else 0
         self._scheduler_total_steps = int(total_steps)
         self._scheduler_warmup_steps = int(warmup_steps)
@@ -974,22 +1070,33 @@ class AdvancedNagatoSakuraTrainer:
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_steps
             )
+
+        self._refresh_scheduler_step_offset(scheduler, source="scheduler_init")
         
         # 混合精度
         scaler = GradScaler(enabled=bool(self.precision_profile["use_grad_scaler"] and self.device.type == 'cuda'))
         global_effective_batch = batch_size * gradient_accumulation_steps * (self.world_size if self.is_distributed else 1)
-        
-        self.logger.info(f"訓練組件設置完成:")
-        self.logger.info(f"  批次大小: {batch_size}")
-        self.logger.info(f"  梯度累積步數: {gradient_accumulation_steps}")
-        self.logger.info(f"  有效批次大小(全域): {global_effective_batch}")
-        self.logger.info(f"  總訓練步數: {total_steps}")
-        self.logger.info(f"  預熱步數: {warmup_steps}")
-        self.logger.info(f"  調度器目標Epoch: {effective_epochs}")
-        self.logger.info(f"  學習率調度器: {lr_scheduler_type}")
-        self.logger.info(f"  DataLoader workers: {num_workers}")
-        self.logger.info(f"  DataLoader drop_last: {bool(dataloader_drop_last)}")
-        self.logger.info(f"  混合精度: {'啟用' if scaler.is_enabled() else '禁用'}")
+        autocast_enabled = bool(self.precision_profile.get("use_autocast") and self.device.type == "cuda")
+        actual_precision = str(self.precision_profile.get("actual_precision", "fp32"))
+        autocast_desc = f"啟用({actual_precision})" if autocast_enabled else "禁用"
+        grad_scaler_desc = "啟用" if scaler.is_enabled() else "禁用"
+
+        self.logger.info(
+            "訓練組件: batch=%s, grad_acc=%s, global_batch=%s, steps=%s, warmup=%s, "
+            "scheduler=%s(target_epoch=%s, updates_per_epoch=%s), workers=%s, drop_last=%s, 混合精度(autocast)=%s, GradScaler=%s",
+            batch_size,
+            gradient_accumulation_steps,
+            global_effective_batch,
+            total_steps,
+            warmup_steps,
+            lr_scheduler_type,
+            effective_epochs,
+            updates_per_epoch,
+            num_workers,
+            bool(dataloader_drop_last),
+            autocast_desc,
+            grad_scaler_desc,
+        )
         
         return train_dataloader, optimizer, scheduler, scaler, train_sampler
 
@@ -1015,7 +1122,6 @@ class AdvancedNagatoSakuraTrainer:
         invalid_loss_count = 0
         invalid_grad_count = 0
         skipped_update_count = 0
-        suspicious_label_ratio_count = 0
         epoch_tokens = 0
         metrics_window_tokens = 0
         optimizer_updates = 0
@@ -1051,9 +1157,6 @@ class AdvancedNagatoSakuraTrainer:
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
-            batch_valid_label_ratio = float(batch.get("valid_label_ratio", 0.0) or 0.0)
-            if batch_valid_label_ratio > 0.0 and (batch_valid_label_ratio < 0.01 or batch_valid_label_ratio > 0.95):
-                suspicious_label_ratio_count += 1
             batch_tokens = int((labels != -100).sum().item())
             epoch_tokens += batch_tokens
             metrics_window_tokens += batch_tokens
@@ -1159,7 +1262,7 @@ class AdvancedNagatoSakuraTrainer:
                 })
 
                 if self.is_main_process and self.global_step % log_interval_steps == 0:
-                    self.logger.info(
+                    self.logger.debug(
                         f"Step {self.global_step}: Loss={avg_loss:.4f}, "
                         f"LR={current_lr:.2e}, GradNorm={grad_norm_value:.4f}"
                     )
@@ -1199,7 +1302,11 @@ class AdvancedNagatoSakuraTrainer:
                     })
                     metrics_window_tokens = 0
 
-                if self.is_main_process and self.global_step % (log_interval_steps * 5) == 0:
+                if (
+                    self.is_main_process
+                    and self.global_step % (log_interval_steps * 5) == 0
+                    and self.logger.isEnabledFor(logging.DEBUG)
+                ):
                     self.system_monitor.log_system_status(self.logger)
 
         if accumulated_steps > 0:
@@ -1246,20 +1353,6 @@ class AdvancedNagatoSakuraTrainer:
                         "value": invalid_ratio,
                     })
 
-        if suspicious_label_ratio_count > 0 and self.is_main_process:
-            self.logger.warning(
-                f"偵測到可疑標籤比例批次: {suspicious_label_ratio_count}/{total_seen_batches} "
-                f"(可能存在 prompt/label 邊界或資料格式異常)"
-            )
-            self.metrics_writer.log_event({
-                "epoch": self.current_epoch + 1,
-                "global_step": self.global_step,
-                "event_type": "suspicious_label_ratio",
-                "severity": "WARNING",
-                "message": "valid label ratio is out of safe range for some batches",
-                "value": suspicious_label_ratio_count,
-            })
-
         avg_epoch_loss = epoch_loss / num_batches
         return {
             "avg_loss": avg_epoch_loss,
@@ -1270,7 +1363,6 @@ class AdvancedNagatoSakuraTrainer:
             "invalid_loss_count": invalid_loss_count,
             "invalid_grad_count": invalid_grad_count,
             "skipped_update_count": skipped_update_count,
-            "suspicious_label_ratio_count": suspicious_label_ratio_count,
             "optimizer_updates": optimizer_updates,
             "tokens_seen": epoch_tokens,
         }
@@ -1506,6 +1598,7 @@ class AdvancedNagatoSakuraTrainer:
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scheduler_total_steps': self._scheduler_total_steps,
                 'scheduler_warmup_steps': self._scheduler_warmup_steps,
+                'scheduler_step_offset': self._scheduler_step_offset,
                 'training_history': dict(self.training_history)
             }
             
@@ -1565,15 +1658,29 @@ class AdvancedNagatoSakuraTrainer:
                     self.logger.warning("檢查點缺少 optimizer 狀態，將使用新優化器狀態")
 
                 scheduler_state = state.get('scheduler_state_dict')
+                scheduler_state_loaded = False
+                scheduler_needs_alignment = False
+                scheduler_alignment_reasons: List[str] = []
                 if scheduler_state is not None:
                     try:
                         scheduler.load_state_dict(scheduler_state)
+                        scheduler_state_loaded = True
                     except Exception as e:
                         self.logger.warning(f"加載 scheduler 狀態失敗，改為按 global_step 對齊: {e}")
-                        self._align_scheduler_to_global_step(scheduler, reason="load_state_failed")
+                        scheduler_needs_alignment = True
+                        scheduler_alignment_reasons.append("load_state_failed")
                 else:
                     self.logger.warning("檢查點缺少 scheduler 狀態，改為按 global_step 對齊")
-                    self._align_scheduler_to_global_step(scheduler, reason="state_missing")
+                    scheduler_needs_alignment = True
+                    scheduler_alignment_reasons.append("state_missing")
+
+                saved_scheduler_step_offset = state.get('scheduler_step_offset')
+                if saved_scheduler_step_offset is not None:
+                    self._set_scheduler_step_offset(int(saved_scheduler_step_offset), source="checkpoint")
+                elif scheduler_state_loaded:
+                    self._refresh_scheduler_step_offset(scheduler, source="loaded_scheduler_state")
+                else:
+                    self._refresh_scheduler_step_offset(scheduler, source="fallback_scheduler_state")
 
                 saved_scheduler_total_steps = state.get('scheduler_total_steps')
                 current_scheduler_total_steps = self._scheduler_total_steps
@@ -1586,7 +1693,12 @@ class AdvancedNagatoSakuraTrainer:
                         f"檢查點 scheduler_total_steps({saved_scheduler_total_steps}) "
                         f"與當前設定({current_scheduler_total_steps})不一致，將按 global_step 對齊"
                     )
-                    self._align_scheduler_to_global_step(scheduler, reason="total_steps_mismatch")
+                    scheduler_needs_alignment = True
+                    scheduler_alignment_reasons.append("total_steps_mismatch")
+
+                if scheduler_needs_alignment:
+                    reason = "+".join(scheduler_alignment_reasons) if scheduler_alignment_reasons else "unknown"
+                    self._align_scheduler_to_global_step(scheduler, reason=reason)
                 else:
                     self._verify_scheduler_alignment(scheduler)
 
@@ -1764,6 +1876,7 @@ class AdvancedNagatoSakuraTrainer:
         early_stopping_warmup_epochs: int = 8,
         resume_from_checkpoint: bool = True,
         resume_checkpoint: Optional[str] = None,
+        resume_lr_scale: float = 1.0,
         eval_interval_epochs: int = 5,
         metrics_log_interval_steps: int = 100,
         save_best_k: int = 3,
@@ -1836,6 +1949,11 @@ class AdvancedNagatoSakuraTrainer:
             dataloader_drop_last=dataloader_drop_last,
         )
 
+        resume_lr_scale = float(resume_lr_scale)
+        auto_match_resume_lr = resume_lr_scale <= 0.0
+        if (not auto_match_resume_lr) and (not math.isfinite(resume_lr_scale) or resume_lr_scale <= 0.0):
+            raise ValueError(f"resume_lr_scale 必須為正且有限數值，收到: {resume_lr_scale}")
+
         eval_dataloader = None
         if eval_dataset:
             collate_fn = partial(
@@ -1882,8 +2000,43 @@ class AdvancedNagatoSakuraTrainer:
                 latest_checkpoint = broadcast_objects[0]
             if latest_checkpoint and self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
                 self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
+
+                effective_resume_lr_scale = resume_lr_scale
+                if auto_match_resume_lr:
+                    resumed_lr = self._get_optimizer_lr(optimizer)
+                    target_lr = float(learning_rate)
+                    if (
+                        resumed_lr is not None
+                        and resumed_lr > 0.0
+                        and math.isfinite(target_lr)
+                        and target_lr > 0.0
+                    ):
+                        effective_resume_lr_scale = target_lr / resumed_lr
+                        self.logger.info(
+                            f"續訓學習率自動對齊 - resumed_lr={resumed_lr:.2e}, "
+                            f"target_lr={target_lr:.2e}, auto_scale={effective_resume_lr_scale:.6f}"
+                        )
+                    else:
+                        effective_resume_lr_scale = 1.0
+                        self.logger.warning("無法取得有效的 resumed_lr，將跳過自動學習率縮放")
+
+                self._apply_resume_lr_scale(
+                    optimizer,
+                    scheduler,
+                    scale=effective_resume_lr_scale,
+                    reason=("resume_checkpoint_auto_match" if auto_match_resume_lr else "resume_checkpoint"),
+                )
             elif resume_checkpoint and self.is_main_process:
                 self.logger.warning("無法從指定檢查點恢復，將從當前狀態開始訓練")
+            elif (
+                self.is_main_process
+                and ((not auto_match_resume_lr and abs(resume_lr_scale - 1.0) >= 1e-12) or auto_match_resume_lr)
+                and not latest_checkpoint
+            ):
+                if auto_match_resume_lr:
+                    self.logger.warning("未找到可恢復的檢查點，續訓學習率自動對齊本次不生效")
+                else:
+                    self.logger.warning("未找到可恢復的檢查點，resume_lr_scale 本次不生效")
 
         early_stopped = False
         run_status = "running"
@@ -2136,7 +2289,14 @@ class AdvancedNagatoSakuraTrainer:
 
             if _has_eval_dataloader(eval_dataloader):
                 final_eval_metrics = self.evaluate(eval_dataloader)
-                self.logger.info(f"最終評估結果: {final_eval_metrics}")
+                self.logger.info(
+                    "最終評估: loss=%.4f, ppl=%.2f, tokens=%s, eval_time=%.2fs",
+                    float(final_eval_metrics.get("eval_loss", float("nan"))),
+                    float(final_eval_metrics.get("perplexity", float("nan"))),
+                    int(final_eval_metrics.get("total_tokens", 0)),
+                    float(final_eval_metrics.get("eval_time_sec", 0.0)),
+                )
+                self.logger.debug("最終評估完整細節: %s", final_eval_metrics)
 
         except KeyboardInterrupt:
             run_status = "interrupted"

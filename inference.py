@@ -44,6 +44,7 @@ class InferenceConfig:
     kv_quant_group_size: Optional[int] = None
     kv_residual_sign_correction: Optional[bool] = None
     num_key_value_heads: Optional[int] = None
+    stateless_chat: bool = False  # 臨時聊天模式，每一輪都視為新對話
 
 class ColoredFormatter(logging.Formatter):
     """彩色日誌格式器"""
@@ -220,12 +221,10 @@ class NagatoSakuraInference:
     
     def _prepare_input(self, prompt: str) -> torch.Tensor:
         """準備輸入"""
-        # 添加BOS令牌
+        # 對齊訓練格式: <bos> + instruction(+input) + "\n"
         bos = self.tokenizer.bos_token or "<s>"
         normalized_prompt = str(prompt).strip()
-        if normalized_prompt and not normalized_prompt.endswith("長門櫻："):
-            normalized_prompt = f"{normalized_prompt}\n長門櫻："
-        formatted_prompt = f"{bos}{normalized_prompt}"
+        formatted_prompt = f"{bos}{normalized_prompt}\n" if normalized_prompt else bos
         
         # 編碼
         input_ids = self.tokenizer.encode(
@@ -384,7 +383,9 @@ class NagatoSakuraInference:
         print("   - 輸入 'quit' 或 'exit' 退出")
         print("   - 輸入 '/help' 查看命令")
         print("   - 輸入 '/config' 查看當前配置")
+        print("   - 輸入 '/temp' 切換臨時聊天模式（每輪新對話）")
         print(f"   - 基礎種子: {self.seed_manager.base_seed}")
+        print(f"   - 臨時聊天模式: {'開啟' if self.config.stateless_chat else '關閉'}")
         print("   - 每次對話都會使用不同的隨機種子")
         print("=" * 60)
         
@@ -413,27 +414,24 @@ class NagatoSakuraInference:
                 full_response = ""
                 
                 try:
-                    current_seed = self.seed_manager.get_new_seed()
                     max_new_tokens = min(1024, max(64, self.config.max_length // 2))
 
-                    for output in self.model.chat_stream(
-                        tokenizer=self.tokenizer,
-                        query=user_input,
-                        history=conversation_history,
+                    for output in self.stream_generate(
+                        user_input,
                         max_new_tokens=max_new_tokens,
                         temperature=self.config.temperature,
                         top_k=self.config.top_k,
                         top_p=self.config.top_p,
                         repetition_penalty=self.config.repetition_penalty,
-                        generation_seed=current_seed,
+                        do_sample=self.config.do_sample,
                     ):
                         if output["finished"]:
                             end_time = time.time()
-                            if output.get("history") is not None:
-                                conversation_history = output["history"]
-
                             if not output.get("error", False):
-                                full_response = output.get("response", full_response)
+                                full_response = output.get("full_response", full_response)
+                                if not self.config.stateless_chat:
+                                    conversation_history.add_turn("user", user_input)
+                                    conversation_history.add_turn("assistant", full_response)
                                 print(f"\n⏱️  生成時間: {end_time - start_time:.2f}秒，"
                                       f"{output.get('tokens_generated', 0)} tokens")
                             break
@@ -466,6 +464,7 @@ class NagatoSakuraInference:
 🌸 可用命令:
 /help - 顯示此幫助
 /config - 顯示當前配置
+/temp [on|off] - 切換臨時聊天模式（每輪新對話）
 /clear - 清空對話歷史
 /history - 顯示對話歷史
 /memory - 顯示內存使用情況
@@ -491,6 +490,7 @@ class NagatoSakuraInference:
 - KV分組: {self.config.kv_quant_group_size if self.config.kv_quant_group_size is not None else '依模型配置'}
 - 殘差符號修正: {self.config.kv_residual_sign_correction if self.config.kv_residual_sign_correction is not None else '依模型配置'}
 - num_key_value_heads: {self.config.num_key_value_heads if self.config.num_key_value_heads is not None else '依模型配置'}
+- 臨時聊天模式: {'開啟' if self.config.stateless_chat else '關閉'}
 - 靜默模式: {'開啟' if self.config.silent_mode else '關閉'}
 - 隨機種子模式: 每次對話使用不同種子
 """)
@@ -502,6 +502,27 @@ class NagatoSakuraInference:
                 print("💡 現在會顯示內存監控信息")
             else:
                 print("💡 內存監控信息已隱藏，輸出更乾淨")
+        elif cmd == "temp":
+            if len(cmd_parts) >= 2:
+                option = cmd_parts[1].strip().lower()
+                if option in {"on", "true", "1", "yes", "enable"}:
+                    self.config.stateless_chat = True
+                elif option in {"off", "false", "0", "no", "disable"}:
+                    self.config.stateless_chat = False
+                else:
+                    print(f"❌ 未知選項: {cmd_parts[1]}，可用 on/off")
+                    return
+            else:
+                self.config.stateless_chat = not self.config.stateless_chat
+
+            if self.config.stateless_chat:
+                conversation_history.clear()
+            mode_text = "開啟" if self.config.stateless_chat else "關閉"
+            print(f"✅ 臨時聊天模式已{mode_text}")
+            if self.config.stateless_chat:
+                print("💡 目前每一輪都會從空白對話開始，不保留上一輪內容")
+            else:
+                print("💡 已恢復一般多輪對話模式")
         elif cmd == "memory":
             self._show_memory_info()
         elif cmd == "cleanup":
@@ -641,7 +662,7 @@ def main():
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-0.8/best_model", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-0.2/checkpoint-epoch-46", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式
@@ -656,7 +677,7 @@ def main():
     # 生成參數
     parser.add_argument("--temperature", type=float, default=0.7, help="溫度參數")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k參數")
-    parser.add_argument("--top_p", type=float, default=0.95, help="Top-p參數")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p參數")
     parser.add_argument("--repetition_penalty", type=float, default=1.1, help="重複懲罰")
     parser.add_argument("--no_sample", action="store_true", help="禁用採樣（使用貪婪解碼）")
 
@@ -672,6 +693,7 @@ def main():
     
     # 調試選項
     parser.add_argument("--verbose", action="store_true", help="啟用詳細輸出（包括內存監控）")
+    parser.add_argument("--stateless_chat", action="store_true", default=True, help="臨時聊天模式：每一輪都視為新對話")
     
     # 其他
     parser.add_argument("--device", type=str, default="auto", help="指定設備")
@@ -711,6 +733,7 @@ def main():
             kv_quant_group_size=args.kv_quant_group_size,
             kv_residual_sign_correction=(True if args.kv_residual_sign_correction else None),
             num_key_value_heads=args.num_key_value_heads,
+            stateless_chat=args.stateless_chat,
         )
         
         # 創建推理器

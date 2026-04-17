@@ -121,7 +121,7 @@ def _plot_system_metrics(step_rows: List[Dict[str, str]], output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot training curves from CSV metrics")
-    parser.add_argument("--metrics_dir", type=str, default="NS-LLM-0.8/metrics", help="metrics 目錄")
+    parser.add_argument("--metrics_dir", type=str, default="NS-LLM-0.2/metrics", help="metrics 目錄")
     parser.add_argument("--output_dir", type=str, default=None, help="圖表輸出目錄，預設為 metrics/plots")
     args = parser.parse_args()
 
