@@ -29,14 +29,14 @@ def main():
 
     # 數據相關
     parser.add_argument("--training_data_file", type=str, help="訓練數據來源（檔案或資料夾）；未指定時使用 data/train")
-    parser.add_argument("--output_dir", type=str, default="NS-LLM-1.0", help="輸出目錄")
+    parser.add_argument("--output_dir", type=str, default="NS-LLM-0.8", help="輸出目錄")
     parser.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
     parser.add_argument("--eval_split_ratio", type=float, default=0.0, help="評估集分割比例（使用固定評估集時請設為0）")
     parser.add_argument("--eval_data_file", type=str, help="固定評估集來源（檔案或資料夾）；未指定時使用 data/eval")
 
     # 模型配置
     parser.add_argument("--vocab_size", type=int, default=65536, help="詞彙表大小")
-    parser.add_argument("--tokenizer_min_frequency", type=int, default=2, help="分詞器最小詞頻")
+    parser.add_argument("--tokenizer_min_frequency", type=int, default=5, help="分詞器最小詞頻")
     parser.add_argument("--tokenizer_train_max_samples", type=int, default=0, help="分詞器最多使用多少訓練樣本（0=不限制）")
     parser.add_argument("--tokenizer_num_threads", type=int, default=0, help="分詞器執行緒數（0=自動）")
     parser.add_argument("--hidden_size", type=int, default=512, help="隱藏層大小")
@@ -56,7 +56,7 @@ def main():
     # 訓練參數
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="梯度累積步數")
-    parser.add_argument("--num_epochs", type=int, default=100, help="訓練輪數")
+    parser.add_argument("--num_epochs", type=int, default=300, help="訓練輪數")
     parser.add_argument("--learning_rate", type=float, default=1.5e-4, help="學習率")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="權重衰減")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
@@ -64,7 +64,11 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪閾值")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="啟用梯度檢查點")
     parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing", help="禁用梯度檢查點")
-    parser.add_argument("--scheduler_target_epochs", type=int, default=50, help="學習率調度目標epoch（可低於實際訓練輪數）")
+    parser.add_argument("--scheduler_target_epochs", type=int, default=150, help="學習率調度目標epoch（可低於實際訓練輪數）")
+    parser.add_argument("--pretokenize_batch_size", type=int, default=1024, help="預分詞批次大小")
+    parser.add_argument("--pretokenize_num_proc", type=int, default=None, help="預分詞進程數（Windows 將固定為 1）")
+    parser.add_argument("--pretokenize_cache", action="store_true", default=True, help="啟用預分詞快取")
+    parser.add_argument("--no_pretokenize_cache", action="store_false", dest="pretokenize_cache", help="禁用預分詞快取")
 
     # 精度與多卡
     parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"], help="訓練精度模式")
@@ -82,20 +86,21 @@ def main():
 
     # 日誌和檢查點
     parser.add_argument("--log_interval", type=int, default=1, help="日誌記錄間隔（按epoch）")
-    parser.add_argument("--save_interval_epochs", type=int, default=10, help="按epoch保存間隔")
-    parser.add_argument("--early_stopping_patience", type=int, default=60, help="早停耐心值（按epoch）")
-    parser.add_argument("--early_stopping_monitor", type=str, default="eval_loss", choices=["train_loss", "eval_loss"], help="早停監控指標")
+    parser.add_argument("--save_interval_epochs", type=int, default=5, help="按epoch保存間隔")
+    parser.add_argument("--early_stopping_patience", type=int, default=120, help="早停耐心值（按epoch）")
+    parser.add_argument("--early_stopping_monitor", type=str, default="train_loss", choices=["train_loss", "eval_loss"], help="早停監控指標")
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0005, help="早停最小改善幅度")
-    parser.add_argument("--early_stopping_warmup_epochs", type=int, default=8, help="早停啟用前的預熱epoch")
-    parser.add_argument("--eval_interval_epochs", type=int, default=5, help="評估間隔（按epoch）")
+    parser.add_argument("--early_stopping_warmup_epochs", type=int, default=12, help="早停啟用前的預熱epoch")
+    parser.add_argument("--eval_interval_epochs", type=int, default=1, help="評估間隔（按epoch）")
     parser.add_argument("--eval_short_max_tokens", type=int, default=64, help="短樣本分桶上限token數")
     parser.add_argument("--eval_medium_max_tokens", type=int, default=256, help="中樣本分桶上限token數")
-    parser.add_argument("--metrics_log_interval_steps", type=int, default=100, help="CSV指標記錄間隔（按optimizer step）")
+    parser.add_argument("--metrics_log_interval_steps", type=int, default=50, help="CSV指標記錄間隔（按optimizer step）")
     parser.add_argument("--save_best_k", type=int, default=3, help="保留最佳checkpoint數量")
     parser.add_argument("--save_latest_k", type=int, default=2, help="保留最新checkpoint數量")
     parser.add_argument("--save_on_improve_delta", type=float, default=0.001, help="達到此改善幅度時觸發保存")
     parser.add_argument("--checkpoint_cleanup", action="store_true", help="啟用舊checkpoint自動清理")
     parser.add_argument("--no_resume", action="store_true", help="不從檢查點恢復")
+    parser.add_argument("--resume_checkpoint", type=str, help="指定恢復的checkpoint路徑（可為相對或絕對路徑）")
 
     # 其他
     parser.add_argument("--device", type=str, default=None, help="指定設備")
@@ -104,6 +109,9 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="日誌級別")
 
     args = parser.parse_args()
+
+    if args.no_resume and args.resume_checkpoint:
+        print("警告: 已設定 --no_resume，將忽略 --resume_checkpoint")
 
     if _should_use_auto_ddp(args):
         world_size = torch.cuda.device_count()
@@ -234,6 +242,9 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             training_data,
             args.eval_split_ratio,
             fixed_eval_data=fixed_eval_data,
+            pretokenize_batch_size=args.pretokenize_batch_size,
+            pretokenize_num_proc=args.pretokenize_num_proc,
+            use_pretokenize_cache=args.pretokenize_cache,
         )
 
         trainer.train(
@@ -254,6 +265,7 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             early_stopping_min_delta=args.early_stopping_min_delta,
             early_stopping_warmup_epochs=args.early_stopping_warmup_epochs,
             resume_from_checkpoint=not args.no_resume,
+            resume_checkpoint=args.resume_checkpoint,
             eval_interval_epochs=args.eval_interval_epochs,
             eval_short_max_tokens=args.eval_short_max_tokens,
             eval_medium_max_tokens=args.eval_medium_max_tokens,

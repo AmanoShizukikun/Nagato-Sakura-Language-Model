@@ -14,7 +14,7 @@ import contextlib
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -31,7 +31,7 @@ from tqdm import tqdm
 from .nagato_sakura_model import NagatoSakuraForCausalLM, NSConfig
 from .logger import setup_logging, SystemMonitor, CSVMetricsWriter
 from .tokenizer import TokenizerManager
-from .data_utils import smart_collate_fn, EarlyStoppingCallback
+from .data_utils import smart_collate_fn, EarlyStoppingCallback, pretokenize_supervised_dataset
 from .checkpoint_manager import CheckpointPolicy, CheckpointManager
 
 # 混合精度處理
@@ -66,6 +66,32 @@ class _NoOpMetricsWriter:
 
     def log_training_summary(self, row: Dict[str, Any]):
         return None
+
+
+class _DistributedEvalSampler(Sampler[int]):
+    """分散式評估取樣器，不補齊且不重複樣本。"""
+
+    def __init__(self, dataset: TorchDataset, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        dataset_size = len(self.dataset)
+        if dataset_size <= self.rank:
+            return 0
+        return ((dataset_size - 1 - self.rank) // self.num_replicas) + 1
+
+
+def _has_eval_dataloader(eval_dataloader: Optional[DataLoader]) -> bool:
+    return eval_dataloader is not None
 
 
 class AdvancedNagatoSakuraTrainer:
@@ -157,6 +183,8 @@ class AdvancedNagatoSakuraTrainer:
         self.checkpoint_manager: Optional[CheckpointManager] = None
         self.eval_short_max_tokens = 64
         self.eval_medium_max_tokens = 256
+        self._scheduler_total_steps: Optional[int] = None
+        self._scheduler_warmup_steps: Optional[int] = None
         best_model_dir = self.output_dir / "best_model"
         if (best_model_dir / "model.pt").exists():
             self.best_checkpoint_path = best_model_dir
@@ -259,6 +287,176 @@ class AdvancedNagatoSakuraTrainer:
         cond_tensor = torch.tensor(1 if condition else 0, device=self.device, dtype=torch.int32)
         dist.all_reduce(cond_tensor, op=dist.ReduceOp.MIN)
         return bool(cond_tensor.item())
+
+    def _sync_partial_accumulation_gradients(self):
+        if not self.is_distributed or self.model is None:
+            return
+        for parameter in self.model.parameters():
+            if parameter.grad is None:
+                continue
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(self.world_size)
+
+    def _finalize_accumulation_window(
+        self,
+        optimizer,
+        scheduler,
+        scaler,
+        *,
+        accumulated_steps: int,
+        gradient_accumulation_steps: int,
+        max_grad_norm: float,
+    ) -> Dict[str, Any]:
+        if accumulated_steps <= 0:
+            return {
+                "applied": False,
+                "invalid_grad": False,
+                "runtime_error": None,
+                "grad_norm": None,
+            }
+
+        if self.model is None:
+            raise RuntimeError("模型尚未初始化")
+
+        try:
+            scaler.unscale_(optimizer)
+
+            if accumulated_steps < gradient_accumulation_steps:
+                correction = gradient_accumulation_steps / max(1, accumulated_steps)
+                for parameter in self.model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(correction)
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_grad_norm,
+            )
+            grad_norm_value = float(grad_norm)
+
+            if not self._all_ranks_true(math.isfinite(grad_norm_value)):
+                if self.is_main_process:
+                    self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
+                    self.metrics_writer.log_event({
+                        "epoch": self.current_epoch + 1,
+                        "global_step": self.global_step,
+                        "event_type": "invalid_grad_norm",
+                        "severity": "WARNING",
+                        "message": "grad norm is nan/inf",
+                        "value": str(grad_norm),
+                        "accumulated_steps": accumulated_steps,
+                    })
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                return {
+                    "applied": False,
+                    "invalid_grad": True,
+                    "runtime_error": None,
+                    "grad_norm": grad_norm_value,
+                }
+
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            return {
+                "applied": True,
+                "invalid_grad": False,
+                "runtime_error": None,
+                "grad_norm": grad_norm_value,
+            }
+        except RuntimeError as error:
+            if self.is_main_process:
+                self.logger.warning(f"梯度累積後 optimizer step 失敗: {error}")
+                self.metrics_writer.log_event({
+                    "epoch": self.current_epoch + 1,
+                    "global_step": self.global_step,
+                    "event_type": "optimizer_step_failed",
+                    "severity": "WARNING",
+                    "message": "optimizer step failed after accumulation",
+                    "value": str(error),
+                    "accumulated_steps": accumulated_steps,
+                })
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            return {
+                "applied": False,
+                "invalid_grad": False,
+                "runtime_error": error,
+                "grad_norm": None,
+            }
+
+    def _resolve_resume_checkpoint_path(self, resume_checkpoint: str) -> Optional[Path]:
+        raw_path = str(resume_checkpoint).strip()
+        if not raw_path:
+            return None
+
+        candidate = Path(raw_path).expanduser()
+        candidates: List[Path] = [candidate]
+        if not candidate.is_absolute():
+            candidates.append(self.output_dir / candidate)
+
+        for path in candidates:
+            normalized = path.parent if path.is_file() else path
+            if normalized.exists() and normalized.is_dir():
+                return normalized
+
+        return None
+
+    def _align_scheduler_to_global_step(self, scheduler, reason: str) -> None:
+        target_last_epoch = max(-1, int(self.global_step) - 1)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                scheduler.step(epoch=target_last_epoch)
+
+            current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None
+            if current_lr is not None:
+                self.logger.info(
+                    f"已對齊學習率調度器({reason}) - global_step: {self.global_step}, "
+                    f"last_epoch: {target_last_epoch}, lr: {current_lr:.2e}"
+                )
+            else:
+                self.logger.info(
+                    f"已對齊學習率調度器({reason}) - global_step: {self.global_step}, "
+                    f"last_epoch: {target_last_epoch}"
+                )
+        except Exception as e:
+            total_steps = getattr(scheduler, "total_steps", None)
+            if isinstance(total_steps, int) and total_steps > 0:
+                capped_last_epoch = min(target_last_epoch, total_steps - 1)
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        scheduler.step(epoch=capped_last_epoch)
+                    current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None
+                    if current_lr is not None:
+                        self.logger.info(
+                            f"已對齊學習率調度器({reason}/capped) - global_step: {self.global_step}, "
+                            f"last_epoch: {capped_last_epoch}, lr: {current_lr:.2e}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"已對齊學習率調度器({reason}/capped) - global_step: {self.global_step}, "
+                            f"last_epoch: {capped_last_epoch}"
+                        )
+                    return
+                except Exception as fallback_error:
+                    self.logger.warning(
+                        f"學習率調度器對齊失敗({reason})，且 capped fallback 失敗: {fallback_error}"
+                    )
+                    return
+
+            self.logger.warning(f"學習率調度器對齊失敗({reason}): {e}")
+
+    def _verify_scheduler_alignment(self, scheduler) -> None:
+        expected_last_epoch = max(-1, int(self.global_step) - 1)
+        actual_last_epoch = int(getattr(scheduler, "last_epoch", -1))
+        if actual_last_epoch != expected_last_epoch:
+            self.logger.warning(
+                f"學習率調度器步數不一致: expected_last_epoch={expected_last_epoch}, "
+                f"actual_last_epoch={actual_last_epoch}, global_step={self.global_step}"
+            )
+            self._align_scheduler_to_global_step(scheduler, reason="step_mismatch")
 
     def initialize_model(self):
         """初始化模型"""
@@ -556,6 +754,9 @@ class AdvancedNagatoSakuraTrainer:
         data_list: List[Dict[str, str]],
         eval_split_ratio: float = 0.01,
         fixed_eval_data: Optional[List[Dict[str, str]]] = None,
+        pretokenize_batch_size: int = 1024,
+        pretokenize_num_proc: Optional[int] = None,
+        use_pretokenize_cache: bool = True,
     ) -> Tuple[Dataset, Optional[Dataset]]:
         """創建訓練和評估數據集"""
         
@@ -564,14 +765,71 @@ class AdvancedNagatoSakuraTrainer:
         if not data_list:
             raise ValueError("數據列表為空")
 
+        if self.tokenizer_manager.transformers_tokenizer is None:
+            raise ValueError("分詞器尚未初始化")
+        if self.model_config is None:
+            raise ValueError("模型配置尚未初始化")
+
+        tokenizer = self.tokenizer_manager.transformers_tokenizer
+        max_seq_length = self.model_config.max_position_embeddings
+        pretokenize_batch_size = max(1, int(pretokenize_batch_size))
+
+        if pretokenize_num_proc is None:
+            cpu_count = os.cpu_count() or 0
+            if sys.platform == "win32":
+                pretokenize_num_proc = 1
+            else:
+                pretokenize_num_proc = min(8, max(2, cpu_count // 2)) if cpu_count else 1
+        else:
+            pretokenize_num_proc = max(1, int(pretokenize_num_proc))
+            if sys.platform == "win32":
+                pretokenize_num_proc = 1
+
+        tokenizer_path = self.tokenizer_manager.tokenizer_path
+        tokenizer_stamp = "missing"
+        if tokenizer_path.exists():
+            stat = tokenizer_path.stat()
+            tokenizer_stamp = f"{stat.st_size}-{stat.st_mtime_ns}"
+
+        cache_root = self.output_dir / "cache" / "pretokenized"
+        self.logger.info(
+            "Pretokenize 設定 - batch_size: %s, num_proc: %s, cache: %s",
+            pretokenize_batch_size,
+            pretokenize_num_proc,
+            "啟用" if use_pretokenize_cache else "停用",
+        )
+
+        def _pretokenize_rows(rows: List[Dict[str, Any]], desc: str, split_name: str) -> Dataset:
+            try:
+                tokenized_dataset = pretokenize_supervised_dataset(
+                    rows,
+                    tokenizer=tokenizer,
+                    max_seq_length=max_seq_length,
+                    desc=desc,
+                    batch_size=pretokenize_batch_size,
+                    num_proc=pretokenize_num_proc,
+                    cache_dir=cache_root,
+                    cache_namespace=f"{split_name}-{tokenizer_stamp}-{max_seq_length}",
+                    use_cache=use_pretokenize_cache,
+                    return_dataset=True,
+                )
+                if len(tokenized_dataset) <= 0:
+                    raise ValueError(f"{desc} produced no valid samples")
+                return tokenized_dataset
+            except Exception as e:
+                self.logger.warning(
+                    f"{desc} 失敗，回退為即時分詞路徑: {e}"
+                )
+                return Dataset.from_list(rows)
+
         if fixed_eval_data is not None:
             if not fixed_eval_data:
                 raise ValueError("固定評估集為空，請檢查 eval_data_file")
             if eval_split_ratio > 0:
                 self.logger.warning("已提供固定評估集，將忽略 eval_split_ratio")
 
-            train_dataset = Dataset.from_list(data_list)
-            eval_dataset = Dataset.from_list(fixed_eval_data)
+            train_dataset = _pretokenize_rows(data_list, "Pretokenize train", "train")
+            eval_dataset = _pretokenize_rows(fixed_eval_data, "Pretokenize eval", "eval")
             self.logger.info(
                 f"使用固定評估集 - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
             )
@@ -587,14 +845,23 @@ class AdvancedNagatoSakuraTrainer:
                 shuffle=True, 
                 seed=42
             )
-            train_dataset = split_datasets["train"]
-            eval_dataset = split_datasets["test"]
+            train_dataset = _pretokenize_rows(
+                list(split_datasets["train"]),
+                "Pretokenize train",
+                "train",
+            )
+            eval_dataset = _pretokenize_rows(
+                list(split_datasets["test"]),
+                "Pretokenize eval",
+                "eval",
+            )
             
             self.logger.info(f"數據集分割完成 - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}")
             return train_dataset, eval_dataset
         else:
-            self.logger.info(f"使用完整數據集進行訓練: {len(dataset)}")
-            return dataset, None
+            train_dataset = _pretokenize_rows(data_list, "Pretokenize train", "train")
+            self.logger.info(f"使用完整數據集進行訓練: {len(train_dataset)}")
+            return train_dataset, None
 
     def setup_training_components(
         self,
@@ -684,6 +951,8 @@ class AdvancedNagatoSakuraTrainer:
         effective_epochs = max(1, int(scheduler_target_epochs or num_epochs))
         total_steps = max(1, len(train_dataloader) // max(1, gradient_accumulation_steps) * effective_epochs)
         warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0 else 0
+        self._scheduler_total_steps = int(total_steps)
+        self._scheduler_warmup_steps = int(warmup_steps)
         
         if lr_scheduler_type == "cosine":
             scheduler = get_cosine_schedule_with_warmup(
@@ -746,11 +1015,15 @@ class AdvancedNagatoSakuraTrainer:
         invalid_loss_count = 0
         invalid_grad_count = 0
         skipped_update_count = 0
+        suspicious_label_ratio_count = 0
         epoch_tokens = 0
-        accumulated_tokens = 0
+        metrics_window_tokens = 0
         optimizer_updates = 0
+        loss_bucket = torch.zeros((), device=self.device)
+        pending_ddp_grad_sync = False
 
         epoch_start_time = time.time()
+        optimizer.zero_grad(set_to_none=True)
 
         total_steps = len(train_dataloader)
         log_interval_steps = max(1, total_steps // max(1, log_steps_per_epoch))
@@ -778,83 +1051,96 @@ class AdvancedNagatoSakuraTrainer:
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
+            batch_valid_label_ratio = float(batch.get("valid_label_ratio", 0.0) or 0.0)
+            if batch_valid_label_ratio > 0.0 and (batch_valid_label_ratio < 0.01 or batch_valid_label_ratio > 0.95):
+                suspicious_label_ratio_count += 1
             batch_tokens = int((labels != -100).sum().item())
             epoch_tokens += batch_tokens
-            accumulated_tokens += batch_tokens
+            metrics_window_tokens += batch_tokens
 
-            with self._autocast_context():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    use_cache=False,
-                )
-                loss = outputs.loss
+            is_last_batch = step == (total_steps - 1)
+            should_sync_gradients = (
+                (accumulated_steps + 1) >= gradient_accumulation_steps or is_last_batch
+            )
+            sync_context = contextlib.nullcontext()
+            using_no_sync = (
+                self.is_distributed
+                and hasattr(self.model, "no_sync")
+                and not should_sync_gradients
+            )
+            if using_no_sync:
+                sync_context = self.model.no_sync()
 
-            local_loss_valid = bool(loss is not None and torch.isfinite(loss).item())
-            if not self._all_ranks_true(local_loss_valid):
-                invalid_loss_count += 1
-                if self.is_main_process:
-                    self.logger.warning(f"檢測到無效損失，跳過此批次: {loss}")
-                    self.metrics_writer.log_event({
-                        "epoch": self.current_epoch + 1,
-                        "global_step": self.global_step,
-                        "event_type": "invalid_loss",
-                        "severity": "WARNING",
-                        "message": "loss is nan/inf or missing",
-                        "value": str(loss),
-                    })
-                accumulated_steps = 0
-                accumulated_tokens = 0
-                skipped_update_count += 1
-                optimizer.zero_grad(set_to_none=True)
-                del outputs
-                continue
+            with sync_context:
+                with self._autocast_context():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        use_cache=False,
+                    )
+                    raw_loss = outputs.loss
 
-            loss = loss / gradient_accumulation_steps
-            scaler.scale(loss).backward()
-
-            loss_val = loss.item() * gradient_accumulation_steps
-            epoch_loss += loss_val
-            num_batches += 1
-            accumulated_steps += 1
-
-            del outputs, loss
-
-            if accumulated_steps >= gradient_accumulation_steps:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_grad_norm
-                )
-                grad_norm_value = float(grad_norm)
-
-                grad_norm_is_finite = math.isfinite(grad_norm_value)
-                if not self._all_ranks_true(grad_norm_is_finite):
-                    invalid_grad_count += 1
+                local_loss_valid = bool(raw_loss is not None and torch.isfinite(raw_loss.detach()).item())
+                if not self._all_ranks_true(local_loss_valid):
+                    invalid_loss_count += 1
                     if self.is_main_process:
-                        self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
+                        self.logger.warning(f"檢測到無效損失，跳過此批次: {raw_loss}")
                         self.metrics_writer.log_event({
                             "epoch": self.current_epoch + 1,
                             "global_step": self.global_step,
-                            "event_type": "invalid_grad_norm",
+                            "event_type": "invalid_loss",
                             "severity": "WARNING",
-                            "message": "grad norm is nan/inf",
-                            "value": str(grad_norm),
+                            "message": "loss is nan/inf or missing",
+                            "value": str(raw_loss),
                         })
                     accumulated_steps = 0
-                    accumulated_tokens = 0
+                    loss_bucket = torch.zeros((), device=self.device)
+                    metrics_window_tokens = 0
                     skipped_update_count += 1
+                    pending_ddp_grad_sync = False
                     optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
+                    del outputs
                     continue
 
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                loss_bucket = loss_bucket + raw_loss.detach()
+                scaled_loss = raw_loss / gradient_accumulation_steps
+                scaler.scale(scaled_loss).backward()
+                pending_ddp_grad_sync = using_no_sync
+
+            num_batches += 1
+            accumulated_steps += 1
+
+            del outputs, raw_loss, scaled_loss
+
+            if accumulated_steps >= gradient_accumulation_steps:
+                loss_sum_value = float(loss_bucket.item())
+                loss_val = loss_sum_value / max(1, accumulated_steps)
+                step_result = self._finalize_accumulation_window(
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    accumulated_steps=accumulated_steps,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    max_grad_norm=max_grad_norm,
+                )
 
                 accumulated_steps = 0
+                loss_bucket = torch.zeros((), device=self.device)
+                pending_ddp_grad_sync = False
+                grad_norm_value = step_result["grad_norm"]
+
+                if step_result["runtime_error"] is not None:
+                    skipped_update_count += 1
+                    continue
+
+                if step_result["invalid_grad"]:
+                    invalid_grad_count += 1
+                    skipped_update_count += 1
+                    metrics_window_tokens = 0
+                    continue
+
+                epoch_loss += loss_sum_value
                 self.global_step += 1
                 optimizer_updates += 1
 
@@ -903,7 +1189,7 @@ class AdvancedNagatoSakuraTrainer:
                         "loss_ema": self.loss_ema,
                         "learning_rate": current_lr,
                         "grad_norm": grad_norm_value,
-                        "batch_tokens": accumulated_tokens,
+                        "batch_tokens": metrics_window_tokens,
                         "tokens_per_sec": tokens_per_sec,
                         "invalid_batches": invalid_batches,
                         "gpu_memory_mb": gpu_memory_mb,
@@ -911,37 +1197,31 @@ class AdvancedNagatoSakuraTrainer:
                         "cpu_percent": system_info.get("cpu_percent", ""),
                         "ram_percent": system_info.get("memory_percent", ""),
                     })
-                    accumulated_tokens = 0
+                    metrics_window_tokens = 0
 
                 if self.is_main_process and self.global_step % (log_interval_steps * 5) == 0:
                     self.system_monitor.log_system_status(self.logger)
 
         if accumulated_steps > 0:
-            try:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_grad_norm
-                )
-                grad_norm_value = float(grad_norm)
-
-                if self._all_ranks_true(math.isfinite(grad_norm_value)):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    self.global_step += 1
-                    optimizer_updates += 1
-                else:
+            if pending_ddp_grad_sync:
+                self._sync_partial_accumulation_gradients()
+            loss_sum_value = float(loss_bucket.item())
+            step_result = self._finalize_accumulation_window(
+                optimizer,
+                scheduler,
+                scaler,
+                accumulated_steps=accumulated_steps,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                max_grad_norm=max_grad_norm,
+            )
+            if step_result["applied"]:
+                epoch_loss += loss_sum_value
+                self.global_step += 1
+                optimizer_updates += 1
+            else:
+                if step_result["invalid_grad"]:
                     invalid_grad_count += 1
-                    skipped_update_count += 1
-                    scaler.update()
-
-                optimizer.zero_grad(set_to_none=True)
-            except RuntimeError as e:
-                self.logger.warning(f"處理剩餘梯度時出錯: {e}")
                 skipped_update_count += 1
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
 
         if num_batches == 0:
             raise RuntimeError(
@@ -966,6 +1246,20 @@ class AdvancedNagatoSakuraTrainer:
                         "value": invalid_ratio,
                     })
 
+        if suspicious_label_ratio_count > 0 and self.is_main_process:
+            self.logger.warning(
+                f"偵測到可疑標籤比例批次: {suspicious_label_ratio_count}/{total_seen_batches} "
+                f"(可能存在 prompt/label 邊界或資料格式異常)"
+            )
+            self.metrics_writer.log_event({
+                "epoch": self.current_epoch + 1,
+                "global_step": self.global_step,
+                "event_type": "suspicious_label_ratio",
+                "severity": "WARNING",
+                "message": "valid label ratio is out of safe range for some batches",
+                "value": suspicious_label_ratio_count,
+            })
+
         avg_epoch_loss = epoch_loss / num_batches
         return {
             "avg_loss": avg_epoch_loss,
@@ -976,6 +1270,7 @@ class AdvancedNagatoSakuraTrainer:
             "invalid_loss_count": invalid_loss_count,
             "invalid_grad_count": invalid_grad_count,
             "skipped_update_count": skipped_update_count,
+            "suspicious_label_ratio_count": suspicious_label_ratio_count,
             "optimizer_updates": optimizer_updates,
             "tokens_seen": epoch_tokens,
         }
@@ -1209,6 +1504,8 @@ class AdvancedNagatoSakuraTrainer:
                 'best_eval_loss': self.best_eval_loss,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'scheduler_total_steps': self._scheduler_total_steps,
+                'scheduler_warmup_steps': self._scheduler_warmup_steps,
                 'training_history': dict(self.training_history)
             }
             
@@ -1260,10 +1557,39 @@ class AdvancedNagatoSakuraTrainer:
                 self.global_step = state.get('global_step', 0)
                 self.best_eval_loss = state.get('best_eval_loss', float('inf'))
                 self.training_history = defaultdict(list, state.get('training_history', {}))
-                
-                optimizer.load_state_dict(state['optimizer_state_dict'])
-                scheduler.load_state_dict(state['scheduler_state_dict'])
-                
+
+                optimizer_state = state.get('optimizer_state_dict')
+                if optimizer_state is not None:
+                    optimizer.load_state_dict(optimizer_state)
+                else:
+                    self.logger.warning("檢查點缺少 optimizer 狀態，將使用新優化器狀態")
+
+                scheduler_state = state.get('scheduler_state_dict')
+                if scheduler_state is not None:
+                    try:
+                        scheduler.load_state_dict(scheduler_state)
+                    except Exception as e:
+                        self.logger.warning(f"加載 scheduler 狀態失敗，改為按 global_step 對齊: {e}")
+                        self._align_scheduler_to_global_step(scheduler, reason="load_state_failed")
+                else:
+                    self.logger.warning("檢查點缺少 scheduler 狀態，改為按 global_step 對齊")
+                    self._align_scheduler_to_global_step(scheduler, reason="state_missing")
+
+                saved_scheduler_total_steps = state.get('scheduler_total_steps')
+                current_scheduler_total_steps = self._scheduler_total_steps
+                if (
+                    saved_scheduler_total_steps is not None
+                    and current_scheduler_total_steps is not None
+                    and int(saved_scheduler_total_steps) != int(current_scheduler_total_steps)
+                ):
+                    self.logger.warning(
+                        f"檢查點 scheduler_total_steps({saved_scheduler_total_steps}) "
+                        f"與當前設定({current_scheduler_total_steps})不一致，將按 global_step 對齊"
+                    )
+                    self._align_scheduler_to_global_step(scheduler, reason="total_steps_mismatch")
+                else:
+                    self._verify_scheduler_alignment(scheduler)
+
                 if scaler and 'scaler_state_dict' in state:
                     scaler.load_state_dict(state['scaler_state_dict'])
             
@@ -1311,13 +1637,16 @@ class AdvancedNagatoSakuraTrainer:
     def find_latest_checkpoint(self) -> Optional[str]:
         """查找最新檢查點"""
         checkpoint_pattern = "checkpoint-*"
-        checkpoints = list(self.output_dir.glob(checkpoint_pattern))
+        checkpoints = [p for p in self.output_dir.glob(checkpoint_pattern) if p.is_dir()]
         
         if not checkpoints:
             return None
+
+        epoch_checkpoints = [p for p in checkpoints if p.name.startswith("checkpoint-epoch-")]
+        candidate_checkpoints = epoch_checkpoints if epoch_checkpoints else checkpoints
         
         # 按修改時間排序
-        latest_checkpoint = max(checkpoints, key=lambda x: x.stat().st_mtime)
+        latest_checkpoint = max(candidate_checkpoints, key=lambda x: x.stat().st_mtime)
         return str(latest_checkpoint)
 
     def _export_training_summary(
@@ -1434,6 +1763,7 @@ class AdvancedNagatoSakuraTrainer:
         early_stopping_min_delta: Optional[float] = None,
         early_stopping_warmup_epochs: int = 8,
         resume_from_checkpoint: bool = True,
+        resume_checkpoint: Optional[str] = None,
         eval_interval_epochs: int = 5,
         metrics_log_interval_steps: int = 100,
         save_best_k: int = 3,
@@ -1515,14 +1845,12 @@ class AdvancedNagatoSakuraTrainer:
                 pack_sequences=False
             )
 
-            eval_sampler: Optional[DistributedSampler] = None
+            eval_sampler: Optional[Sampler[int]] = None
             if self.is_distributed:
-                eval_sampler = DistributedSampler(
+                eval_sampler = _DistributedEvalSampler(
                     eval_dataset,
                     num_replicas=self.world_size,
                     rank=self.rank,
-                    shuffle=False,
-                    drop_last=False,
                 )
 
             eval_dataloader = DataLoader(
@@ -1536,13 +1864,26 @@ class AdvancedNagatoSakuraTrainer:
             )
 
         if resume_from_checkpoint:
-            latest_checkpoint = self.find_latest_checkpoint() if self.is_main_process else None
+            latest_checkpoint: Optional[str] = None
+            if self.is_main_process:
+                if resume_checkpoint:
+                    resolved_resume_checkpoint = self._resolve_resume_checkpoint_path(resume_checkpoint)
+                    if resolved_resume_checkpoint is None:
+                        self.logger.warning(
+                            f"指定的 resume_checkpoint 不存在或不可用: {resume_checkpoint}"
+                        )
+                    else:
+                        latest_checkpoint = str(resolved_resume_checkpoint)
+                else:
+                    latest_checkpoint = self.find_latest_checkpoint()
             if self.is_distributed:
                 broadcast_objects: List[Optional[str]] = [latest_checkpoint]
                 dist.broadcast_object_list(broadcast_objects, src=0)
                 latest_checkpoint = broadcast_objects[0]
             if latest_checkpoint and self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
                 self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
+            elif resume_checkpoint and self.is_main_process:
+                self.logger.warning("無法從指定檢查點恢復，將從當前狀態開始訓練")
 
         early_stopped = False
         run_status = "running"
@@ -1615,7 +1956,7 @@ class AdvancedNagatoSakuraTrainer:
 
                 had_anomaly = (epoch_stats["invalid_loss_count"] > 0) or (epoch_stats["invalid_grad_count"] > 0)
 
-                run_eval = bool(eval_dataloader) and (
+                run_eval = _has_eval_dataloader(eval_dataloader) and (
                     eval_interval_epochs <= 1
                     or (epoch + 1) % eval_interval_epochs == 0
                     or epoch == 0
@@ -1793,7 +2134,7 @@ class AdvancedNagatoSakuraTrainer:
                     reasons=["final_export"],
                 )
 
-            if eval_dataloader:
+            if _has_eval_dataloader(eval_dataloader):
                 final_eval_metrics = self.evaluate(eval_dataloader)
                 self.logger.info(f"最終評估結果: {final_eval_metrics}")
 

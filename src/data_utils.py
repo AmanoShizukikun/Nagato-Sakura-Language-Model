@@ -1,10 +1,15 @@
 import torch
 import logging
+import hashlib
+import os
 from typing import List, Dict, Any, Optional, Tuple, Iterator, Union
 from transformers import PreTrainedTokenizerFast
 from dataclasses import dataclass
 import json
 import time
+from pathlib import Path
+
+from datasets import Dataset, load_from_disk
 
 
 def _clean_optional_text(value: Any) -> str:
@@ -53,6 +58,323 @@ def _compose_instruction_text(item: Dict[str, str]) -> str:
     if input_text:
         return f"{instruction}\n{input_text}".strip()
     return instruction
+
+
+def _normalize_pretokenized_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+
+    input_ids = item.get("input_ids")
+    prompt_len = item.get("prompt_len")
+    seq_len = item.get("seq_len")
+    label_token_count = item.get("label_token_count")
+
+    if not isinstance(input_ids, list) or not input_ids:
+        return None
+    if not all(isinstance(token_id, int) for token_id in input_ids):
+        return None
+    if not isinstance(prompt_len, int):
+        return None
+
+    actual_seq_len = len(input_ids)
+    if isinstance(seq_len, int):
+        actual_seq_len = max(0, min(seq_len, actual_seq_len))
+    actual_prompt_len = max(0, min(prompt_len, actual_seq_len))
+
+    actual_label_token_count = actual_seq_len - actual_prompt_len
+    if isinstance(label_token_count, int):
+        actual_label_token_count = max(0, min(label_token_count, actual_label_token_count))
+
+    if actual_label_token_count <= 0:
+        return None
+
+    return {
+        "input_ids": input_ids[:actual_seq_len],
+        "prompt_len": actual_prompt_len,
+        "seq_len": actual_seq_len,
+        "label_token_count": actual_label_token_count,
+    }
+
+
+def build_pretokenized_supervised_item(
+    item: Dict[str, Any],
+    tokenizer: PreTrainedTokenizerFast,
+    max_seq_length: int,
+) -> Optional[Dict[str, Any]]:
+    pretokenized = _normalize_pretokenized_item(item)
+    if pretokenized is not None:
+        return pretokenized
+
+    normalized_item = _normalize_supervised_item(item)
+    if normalized_item is None:
+        return None
+
+    bos = tokenizer.bos_token or "<s>"
+    eos = tokenizer.eos_token or "</s>"
+    prompt = _compose_instruction_text(normalized_item)
+    completion = str(normalized_item["output"]).strip()
+    if not prompt or not completion:
+        return None
+
+    prompt_with_bos = f"{bos}{prompt}\n"
+    full_text = f"{prompt_with_bos}{completion}{eos}"
+
+    input_ids = tokenizer.encode(full_text, add_special_tokens=False)
+    if max_seq_length and len(input_ids) > max_seq_length:
+        input_ids = input_ids[:max_seq_length]
+    if not input_ids:
+        return None
+
+    prompt_len = len(tokenizer.encode(prompt_with_bos, add_special_tokens=False))
+    prompt_len = min(prompt_len, len(input_ids))
+    label_token_count = len(input_ids) - prompt_len
+    if label_token_count <= 0:
+        return None
+
+    return {
+        "input_ids": input_ids,
+        "prompt_len": prompt_len,
+        "seq_len": len(input_ids),
+        "label_token_count": label_token_count,
+    }
+
+
+def _batch_rows_from_columnar_batch(batch: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    if not batch:
+        return []
+
+    keys = list(batch.keys())
+    if not keys:
+        return []
+
+    batch_size = len(batch[keys[0]])
+    rows: List[Dict[str, Any]] = []
+    for row_idx in range(batch_size):
+        rows.append({key: batch[key][row_idx] for key in keys})
+    return rows
+
+
+def _batched_tokenize_texts(
+    tokenizer: PreTrainedTokenizerFast,
+    texts: List[str],
+    max_seq_length: int,
+) -> List[List[int]]:
+    if not texts:
+        return []
+
+    try:
+        encoded = tokenizer(
+            texts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_seq_length,
+            padding=False,
+            return_attention_mask=False,
+        )
+        input_ids = encoded.get("input_ids", [])
+        if isinstance(input_ids, list):
+            return [list(map(int, ids)) for ids in input_ids]
+    except Exception:
+        pass
+
+    encoded_sequences: List[List[int]] = []
+    for text in texts:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if max_seq_length and len(token_ids) > max_seq_length:
+            token_ids = token_ids[:max_seq_length]
+        encoded_sequences.append([int(token_id) for token_id in token_ids])
+    return encoded_sequences
+
+
+def _batched_pretokenize_records(
+    batch: Dict[str, List[Any]],
+    tokenizer: PreTrainedTokenizerFast,
+    max_seq_length: int,
+) -> Dict[str, List[Any]]:
+    rows = _batch_rows_from_columnar_batch(batch)
+    if not rows:
+        return {
+            "input_ids": [],
+            "prompt_len": [],
+            "seq_len": [],
+            "label_token_count": [],
+        }
+
+    bos = tokenizer.bos_token or "<s>"
+    eos = tokenizer.eos_token or "</s>"
+    prepared_items: List[Dict[str, Any]] = []
+    prompt_texts: List[str] = []
+    full_texts: List[str] = []
+
+    for row in rows:
+        pretokenized = _normalize_pretokenized_item(row)
+        if pretokenized is not None:
+            prepared_items.append(pretokenized)
+            continue
+
+        normalized_item = _normalize_supervised_item(row)
+        if normalized_item is None:
+            continue
+
+        prompt = _compose_instruction_text(normalized_item)
+        completion = str(normalized_item["output"]).strip()
+        if not prompt or not completion:
+            continue
+
+        prompt_with_bos = f"{bos}{prompt}\n"
+        prepared_items.append({
+            "_batched_prompt_index": len(prompt_texts),
+        })
+        prompt_texts.append(prompt_with_bos)
+        full_texts.append(f"{prompt_with_bos}{completion}{eos}")
+
+    encoded_prompt_ids = _batched_tokenize_texts(tokenizer, prompt_texts, max_seq_length=max_seq_length)
+    encoded_full_ids = _batched_tokenize_texts(tokenizer, full_texts, max_seq_length=max_seq_length)
+
+    output = {
+        "input_ids": [],
+        "prompt_len": [],
+        "seq_len": [],
+        "label_token_count": [],
+    }
+
+    for item in prepared_items:
+        if "input_ids" in item:
+            input_ids = item["input_ids"]
+            prompt_len = item["prompt_len"]
+            seq_len = item["seq_len"]
+            label_token_count = item["label_token_count"]
+        else:
+            encoded_idx = int(item["_batched_prompt_index"])
+            if encoded_idx >= len(encoded_prompt_ids) or encoded_idx >= len(encoded_full_ids):
+                continue
+
+            input_ids = encoded_full_ids[encoded_idx]
+            if not input_ids:
+                continue
+
+            seq_len = len(input_ids)
+            prompt_len = min(len(encoded_prompt_ids[encoded_idx]), seq_len)
+            label_token_count = seq_len - prompt_len
+            if label_token_count <= 0:
+                continue
+
+        output["input_ids"].append(input_ids[:seq_len])
+        output["prompt_len"].append(int(prompt_len))
+        output["seq_len"].append(int(seq_len))
+        output["label_token_count"].append(int(label_token_count))
+
+    return output
+
+
+def _build_pretokenize_cache_fingerprint(
+    data_list: List[Dict[str, Any]],
+    max_seq_length: int,
+    cache_namespace: str = "",
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(max_seq_length).encode("utf-8"))
+    digest.update(cache_namespace.encode("utf-8"))
+    digest.update(str(len(data_list)).encode("utf-8"))
+
+    if not data_list:
+        return digest.hexdigest()[:16]
+
+    sample_budget = min(len(data_list), 4096)
+    if sample_budget <= 0:
+        return digest.hexdigest()[:16]
+
+    if len(data_list) <= sample_budget:
+        sample_indices = list(range(len(data_list)))
+    else:
+        sample_indices = sorted({
+            0,
+            len(data_list) - 1,
+            len(data_list) // 2,
+            *[
+                min(len(data_list) - 1, (len(data_list) * step) // max(1, sample_budget - 1))
+                for step in range(sample_budget)
+            ],
+        })
+
+    for idx in sample_indices:
+        normalized = _normalize_supervised_item(data_list[idx])
+        if normalized is None:
+            normalized = _normalize_pretokenized_item(data_list[idx]) or {}
+        digest.update(json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+    return digest.hexdigest()[:16]
+
+
+def pretokenize_supervised_dataset(
+    data_list: List[Dict[str, Any]],
+    tokenizer: PreTrainedTokenizerFast,
+    max_seq_length: int,
+    desc: str = "Pretokenizing",
+    batch_size: int = 1024,
+    num_proc: int = 1,
+    cache_dir: Optional[Union[str, Path]] = None,
+    cache_namespace: str = "",
+    use_cache: bool = True,
+    return_dataset: bool = False,
+) -> Union[List[Dict[str, Any]], Dataset]:
+    if not data_list:
+        empty_dataset = Dataset.from_list([])
+        return empty_dataset if return_dataset else []
+
+    batch_size = max(1, int(batch_size))
+    num_proc = max(1, int(num_proc))
+    if os.name == "nt":
+        num_proc = 1
+
+    if num_proc > 1:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    else:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+    cache_path: Optional[Path] = None
+    if cache_dir is not None:
+        cache_root = Path(cache_dir)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_fingerprint = _build_pretokenize_cache_fingerprint(
+            data_list=data_list,
+            max_seq_length=max_seq_length,
+            cache_namespace=cache_namespace,
+        )
+        cache_path = cache_root / f"{desc.lower().replace(' ', '_')}_{cache_fingerprint}"
+
+        if use_cache and cache_path.exists():
+            cached_dataset = load_from_disk(str(cache_path))
+            return cached_dataset if return_dataset else list(cached_dataset)
+
+    raw_dataset = Dataset.from_list(data_list)
+    map_kwargs: Dict[str, Any] = {
+        "batched": True,
+        "batch_size": batch_size,
+        "remove_columns": raw_dataset.column_names,
+        "fn_kwargs": {
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+        "desc": desc,
+        "load_from_cache_file": False,
+    }
+    if num_proc > 1:
+        map_kwargs["num_proc"] = num_proc
+
+    tokenized_dataset = raw_dataset.map(
+        _batched_pretokenize_records,
+        **map_kwargs,
+    )
+
+    if len(tokenized_dataset) <= 0:
+        empty_dataset = Dataset.from_list([])
+        return empty_dataset if return_dataset else []
+
+    if cache_path is not None and use_cache:
+        tokenized_dataset.save_to_disk(str(cache_path))
+
+    return tokenized_dataset if return_dataset else list(tokenized_dataset)
 
 
 def _tokenize_batch_with_fallback(
@@ -191,81 +513,72 @@ class ConversationDataProcessor:
 def smart_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizerFast, 
                     max_seq_length: int, pack_sequences: bool = True) -> Dict[str, Optional[torch.Tensor]]:
     """智能數據整理函數，支持序列打包和流式對話"""
-    
-    # 過濾無效數據
+
     valid_batch = []
     for item in batch:
-        normalized_item = _normalize_supervised_item(item) if item and isinstance(item, dict) else None
-        if normalized_item:
-            valid_batch.append(normalized_item)
-    
+        prepared = build_pretokenized_supervised_item(item, tokenizer, max_seq_length) if item and isinstance(item, dict) else None
+        if prepared is not None:
+            valid_batch.append(prepared)
+
     if not valid_batch:
-        return {"input_ids": None, "attention_mask": None, "labels": None}
-    
-    bos = tokenizer.bos_token or "<s>"
-    eos = tokenizer.eos_token or "</s>"
+        return {
+            "input_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            "batch_token_count": 0,
+            "valid_label_count": 0,
+            "valid_label_ratio": 0.0,
+        }
+
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    
+
     if pad_token_id is None:
         raise ValueError("分詞器缺少 pad_token_id")
-    
-    # 構建完整文本和計算prompt長度
-    full_texts = []
-    prompt_lengths = []
-    
-    for item in valid_batch:
-        prompt = _compose_instruction_text(item)
-        completion = str(item["output"]).strip()
-        full_text = f"{bos}{prompt}\n{completion}{eos}"
-        full_texts.append(full_text)
-        
-        # 計算prompt長度（包含BOS）
-        prompt_with_bos = f"{bos}{prompt}\n"
-        prompt_length = len(tokenizer.encode(prompt_with_bos, add_special_tokens=False))
-        prompt_lengths.append(prompt_length)
-    
-    # 序列打包優化
-    if pack_sequences and len(full_texts) > 1:
-        # 按長度排序以更好地打包
-        text_length_pairs = [(text, length) for text, length in zip(full_texts, prompt_lengths)]
-        text_length_pairs.sort(key=lambda x: len(tokenizer.encode(x[0], add_special_tokens=False)))
-        full_texts = [pair[0] for pair in text_length_pairs]
-        prompt_lengths = [pair[1] for pair in text_length_pairs]
-    
-    try:
-        # 編碼批次
-        encoded_batch = _tokenize_batch_with_fallback(
-            tokenizer=tokenizer,
-            texts=full_texts,
-            max_seq_length=max_seq_length,
-            padding="longest"
-        )
-        
-        input_ids = encoded_batch["input_ids"]
-        attention_mask = encoded_batch["attention_mask"]
-        labels = input_ids.clone()
-        
-        # 掩蔽prompt部分
-        for i, prompt_len in enumerate(prompt_lengths):
-            actual_prompt_len = min(prompt_len, labels.shape[1])
-            labels[i, :actual_prompt_len] = -100
-        
-        # 掩蔽填充令牌
-        labels[attention_mask == 0] = -100
-        
-        # 檢查是否有有效標籤
-        if not (labels != -100).any():
-            return {"input_ids": None, "attention_mask": None, "labels": None}
-        
+
+    if pack_sequences and len(valid_batch) > 1:
+        valid_batch.sort(key=lambda item: item["seq_len"])
+
+    target_len = max(item["seq_len"] for item in valid_batch)
+    batch_size = len(valid_batch)
+    input_ids = torch.full((batch_size, target_len), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, target_len), dtype=torch.long)
+    labels = torch.full((batch_size, target_len), -100, dtype=torch.long)
+
+    for row_idx, item in enumerate(valid_batch):
+        seq_len = min(item["seq_len"], target_len)
+        if seq_len <= 0:
+            continue
+
+        ids_tensor = torch.tensor(item["input_ids"][:seq_len], dtype=torch.long)
+        input_ids[row_idx, :seq_len] = ids_tensor
+        attention_mask[row_idx, :seq_len] = 1
+
+        prompt_len = min(item["prompt_len"], seq_len)
+        if prompt_len < seq_len:
+            labels[row_idx, prompt_len:seq_len] = ids_tensor[prompt_len:seq_len]
+
+    valid_label_count = int((labels != -100).sum().item())
+    total_label_count = int(labels.numel())
+    valid_label_ratio = float(valid_label_count / max(1, total_label_count))
+
+    if valid_label_count <= 0:
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
+            "input_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            "batch_token_count": 0,
+            "valid_label_count": 0,
+            "valid_label_ratio": 0.0,
         }
-        
-    except Exception as e:
-        logging.getLogger(__name__).error(f"批次編碼錯誤: {e}")
-        return {"input_ids": None, "attention_mask": None, "labels": None}
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "batch_token_count": valid_label_count,
+        "valid_label_count": valid_label_count,
+        "valid_label_ratio": valid_label_ratio,
+    }
 
 def stream_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenizerFast,
                      max_seq_length: int) -> Dict[str, torch.Tensor]:
@@ -280,9 +593,9 @@ def stream_collate_fn(batch: List[Dict[str, Any]], tokenizer: PreTrainedTokenize
                 texts.append(composed_prompt)
                 continue
 
-        if "text" in item:
+        if isinstance(item, dict) and "text" in item:
             texts.append(item["text"])
-        elif "prompt" in item:
+        elif isinstance(item, dict) and "prompt" in item:
             texts.append(item["prompt"])
     
     if not texts:

@@ -47,13 +47,20 @@ class TokenizerManager:
         num_threads: int = 0,
     ):
         """創建並訓練分詞器"""
+        previous_tokenizers_parallelism = os.environ.get("TOKENIZERS_PARALLELISM")
+        previous_rayon_threads = os.environ.get("RAYON_NUM_THREADS")
+        tokenizers_parallelism_override_applied = False
+        rayon_override_applied = False
         try:
             from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors, trainers
 
             # 讓 Rust tokenizers 明確啟用平行化，並允許手動指定執行緒。
-            os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+            if previous_tokenizers_parallelism is None:
+                os.environ["TOKENIZERS_PARALLELISM"] = "true"
+                tokenizers_parallelism_override_applied = True
             if num_threads and int(num_threads) > 0:
                 os.environ["RAYON_NUM_THREADS"] = str(max(1, int(num_threads)))
+                rayon_override_applied = True
             
             # 創建BPE分詞器
             tokenizer = Tokenizer(models.BPE())
@@ -100,6 +107,17 @@ class TokenizerManager:
         except Exception as e:
             self.logger.error(f"分詞器訓練失敗: {e}")
             raise
+        finally:
+            if tokenizers_parallelism_override_applied:
+                if previous_tokenizers_parallelism is None:
+                    os.environ.pop("TOKENIZERS_PARALLELISM", None)
+                else:
+                    os.environ["TOKENIZERS_PARALLELISM"] = previous_tokenizers_parallelism
+            if rayon_override_applied:
+                if previous_rayon_threads is None:
+                    os.environ.pop("RAYON_NUM_THREADS", None)
+                else:
+                    os.environ["RAYON_NUM_THREADS"] = previous_rayon_threads
     
     def prepare_tokenizer(
         self,
