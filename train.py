@@ -3,7 +3,6 @@ import sys
 import multiprocessing
 import warnings
 import argparse
-
 import torch
 from datasets import Dataset
 
@@ -33,26 +32,26 @@ def main():
     
     # 模型配置
     parser.add_argument("--vocab_size", type=int, default=65536, help="詞彙表大小")
-    parser.add_argument("--hidden_size", type=int, default=1024, help="隱藏層大小")
-    parser.add_argument("--num_layers", type=int, default=16, help="層數")
-    parser.add_argument("--num_heads", type=int, default=16, help="注意力頭數")
-    parser.add_argument("--num_key_value_heads", type=int, default=8, help="GQA 的 key/value 頭數")
-    parser.add_argument("--intermediate_size", type=int, default=4096, help="MLP中間層大小")
+    parser.add_argument("--hidden_size", type=int, default=512, help="隱藏層大小")
+    parser.add_argument("--num_layers", type=int, default=8, help="層數")
+    parser.add_argument("--num_heads", type=int, default=8, help="注意力頭數")
+    parser.add_argument("--num_key_value_heads", type=int, default=4, help="GQA 的 key/value 頭數")
+    parser.add_argument("--intermediate_size", type=int, default=1536, help="MLP中間層大小")
     parser.add_argument("--max_seq_length", type=int, default=4096, help="最大序列長度")
     parser.add_argument("--memory_tokens", type=int, default=32, help="記憶令牌數量")
-    parser.add_argument("--quantize_kv_cache", action="store_true", help="啟用 KV cache 量化")
+    parser.add_argument("--quantize_kv_cache", action="store_true", default=True, help="啟用 KV cache 量化")
     parser.add_argument("--kv_cache_bits", type=int, default=4, choices=[3, 4, 8, 16, 32], help="KV cache 位寬")
     parser.add_argument("--kv_quant_group_size", type=int, default=64, help="KV 量化分組大小")
-    parser.add_argument("--kv_residual_sign_correction", action="store_true", help="啟用 1-bit 殘差符號修正")
+    parser.add_argument("--kv_residual_sign_correction", action="store_true", default=True, help="啟用 1-bit 殘差符號修正")
     
     # 訓練參數
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="梯度累積步數")
     parser.add_argument("--num_epochs", type=int, default=1000, help="訓練輪數")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="學習率")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="學習率")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="權重衰減")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
-    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="預熱比例")
+    parser.add_argument("--warmup_ratio", type=float, default=0.001, help="預熱比例")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪閾值")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="啟用梯度檢查點")
     

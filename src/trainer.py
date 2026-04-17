@@ -338,16 +338,20 @@ class AdvancedNagatoSakuraTrainer:
             if loss is None or torch.isnan(loss) or torch.isinf(loss):
                 self.logger.warning(f"檢測到無效損失，跳過此批次: {loss}")
                 accumulated_steps = 0
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 continue
             
             # 反向傳播
             loss = loss / gradient_accumulation_steps
             scaler.scale(loss).backward()
             
-            epoch_loss += loss.item()
+            loss_val = loss.item() * gradient_accumulation_steps
+            epoch_loss += loss_val
             num_batches += 1
             accumulated_steps += 1
+            
+            # 立即釋放計算圖記憶體
+            del outputs, loss
             
             # 梯度更新
             if accumulated_steps >= gradient_accumulation_steps:
@@ -362,7 +366,7 @@ class AdvancedNagatoSakuraTrainer:
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                     self.logger.warning(f"檢測到無效梯度範數: {grad_norm}")
                     accumulated_steps = 0
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     scaler.update()
                     continue
                 
@@ -370,7 +374,7 @@ class AdvancedNagatoSakuraTrainer:
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
                 accumulated_steps = 0
                 self.global_step += 1
@@ -378,7 +382,7 @@ class AdvancedNagatoSakuraTrainer:
                 # 更新進度條
                 current_lr = scheduler.get_last_lr()[0]
                 progress_bar.set_postfix({
-                    "Loss": f"{loss.item() * gradient_accumulation_steps:.4f}",
+                    "Loss": f"{loss_val:.4f}",
                     "LR": f"{current_lr:.2e}",
                     "Step": self.global_step
                 })
@@ -421,10 +425,10 @@ class AdvancedNagatoSakuraTrainer:
                 else:
                     scaler.update()
                 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
             except RuntimeError as e:
                 self.logger.warning(f"處理剩餘梯度時出錯: {e}")
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 scaler.update()
         
         if num_batches == 0:
@@ -476,6 +480,9 @@ class AdvancedNagatoSakuraTrainer:
                     valid_tokens = (labels != -100).sum().item()
                     total_tokens += valid_tokens
                     num_batches += 1
+                
+                # 釋放評估時的計算圖與張量
+                del outputs, loss
         
         if num_batches == 0:
             return {"eval_loss": float('inf'), "perplexity": float('inf')}

@@ -3,8 +3,38 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import math
+import functools
 
 import torch
+
+
+@functools.lru_cache(maxsize=32)
+def _get_rademacher_vector(dim: int, device: torch.device) -> torch.Tensor:
+    """Generate a deterministic Rademacher (+1/-1) vector for TurboQuant rotation."""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(42)  # Fixed seed ensures identical encoding/decoding rotation
+    return (torch.randint(0, 2, (dim,), generator=gen, device=device, dtype=torch.float32) * 2 - 1)
+
+def fast_walsh_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the Fast Walsh-Hadamard Transform (FWHT) along the last dimension.
+    The dimension size must be a power of 2.
+    """
+    d = x.shape[-1]
+    if (d & (d - 1)) != 0:
+        raise ValueError(f"FWHT dimension must be a power of 2, got {d}")
+        
+    h = x.contiguous()
+    step = 1
+    while step < d:
+        shape = h.shape[:-1] + (d // (step * 2), 2, step)
+        h_view = h.view(shape)
+        a = h_view[..., 0, :].clone()
+        b = h_view[..., 1, :].clone()
+        h_view[..., 0, :] = a + b
+        h_view[..., 1, :] = a - b
+        step *= 2
+    return h / math.sqrt(d)
 
 
 TensorLikeKV = Union[torch.Tensor, "QuantizedTensor"]
@@ -45,6 +75,13 @@ class QuantizedTensor:
             correction = direction * (scale / (2.0 * max(qmax, 1.0)))
             values = values + correction
 
+        # ========================================================
+        # [Authentic TurboQuant] Inverse FWHT & Rademacher
+        # ========================================================
+        values = fast_walsh_hadamard_transform(values)
+        rademacher = _get_rademacher_vector(self.group_size, values.device)
+        values = values * rademacher
+
         flat = values.reshape(-1)
         total_size = 1
         for dim in self.shape:
@@ -79,6 +116,8 @@ def _reshape_groups(flat_values: torch.Tensor, group_size: int) -> Tuple[torch.T
     if num_values == 0:
         return flat_values.reshape(0, group_size), 0
 
+    # Ensure power of 2 for FWHT natively
+    group_size = 1 << (group_size - 1).bit_length()
     num_groups = int(math.ceil(num_values / group_size))
     padded_len = num_groups * group_size
     if padded_len != num_values:
@@ -107,22 +146,26 @@ def quantize_tensor(
         raise ValueError(f"Unsupported quantization bits: {bits}")
 
     group_size = max(1, group_size)
+    group_size = 1 << (group_size - 1).bit_length()  # Force PO2 for FWHT
+
     flat = tensor.detach().to(torch.float32).reshape(-1)
     grouped, num_values = _reshape_groups(flat, group_size)
 
+    # ========================================================
+    # [Authentic TurboQuant] Vector Rotation
+    # ========================================================
+    rademacher = _get_rademacher_vector(group_size, grouped.device)
+    rotated = grouped * rademacher
+    rotated = fast_walsh_hadamard_transform(rotated)
+
     qmax = float((1 << (bits - 1)) - 1)
-    scale = grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / max(qmax, 1.0)
-    q = torch.round(grouped / scale).clamp(-qmax, qmax).to(torch.int8)
+    scale = rotated.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / max(qmax, 1.0)
+    q = torch.round(rotated / scale).clamp(-qmax, qmax).to(torch.int8)
 
     residual_sign = None
     if use_residual_sign:
         recon = q.to(torch.float32) * scale
-        residual_sign = (grouped >= recon).to(torch.uint8)
-
-    if q.numel() > num_values:
-        q = q.reshape(-1)[: math.ceil(num_values / group_size) * group_size].reshape(-1, group_size)
-        if residual_sign is not None:
-            residual_sign = residual_sign.reshape(-1)[: math.ceil(num_values / group_size) * group_size].reshape(-1, group_size)
+        residual_sign = (rotated >= recon).to(torch.uint8)
 
     return QuantizedTensor(
         q=q,

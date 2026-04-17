@@ -160,12 +160,15 @@ class NSRotaryEmbedding(nn.Module):
         seq_len_in = value.shape[-2]
         if seq_len is None:
             seq_len = seq_len_in
-        if seq_len > self.max_seq_len_cached or self.cos_cached.device != value.device or self.cos_cached.dtype != value.dtype:
-            self._set_cos_sin_cache(seq_len=max(seq_len, self.max_seq_len_cached), device=value.device, dtype=value.dtype)
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=value.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=value.dtype),
-        )
+            
+        # 只在長度不足時才重新構造 buffer，避免 device/dtype 轉換頻繁觸發記憶體重新分配
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=value.device, dtype=torch.float32)
+            
+        # 回傳時轉換到目標 dtype 與 device
+        cos = self.cos_cached[:, :, :seq_len, ...].to(device=value.device, dtype=value.dtype)
+        sin = self.sin_cached[:, :, :seq_len, ...].to(device=value.device, dtype=value.dtype)
+        return cos, sin
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """旋轉張量的一半維度"""
@@ -1129,15 +1132,9 @@ class NagatoSakuraModel(nn.Module):
 
             # 梯度檢查點處理
             if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        outputs = module(*inputs)
-                        return outputs
-                    return custom_forward
-
                 try:
                     layer_outputs = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(decoder_layer),
+                        decoder_layer,
                         hidden_states,
                         attention_mask_for_layers,
                         position_ids,
