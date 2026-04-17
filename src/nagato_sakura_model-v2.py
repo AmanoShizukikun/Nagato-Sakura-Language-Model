@@ -3,9 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import logging
-from typing import Optional, Tuple, List, Union, Dict, Any
+from typing import Optional, Tuple, List, Union, Dict, Any, Iterator
 from dataclasses import dataclass
 import warnings
+import json
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +21,83 @@ class NagatoSakuraOutput:
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     loss: Optional[torch.FloatTensor] = None
+
+# 對話歷史管理
+@dataclass
+class ConversationTurn:
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: Optional[float] = None
+
+class ConversationHistory:
+    """對話歷史管理器"""
+    
+    def __init__(self, max_turns: int = 50, max_length: int = 4096):
+        self.turns: List[ConversationTurn] = []
+        self.max_turns = max_turns
+        self.max_length = max_length
+    
+    def add_turn(self, role: str, content: str, timestamp: Optional[float] = None):
+        """添加對話輪次"""
+        import time
+        if timestamp is None:
+            timestamp = time.time()
+        
+        turn = ConversationTurn(role=role, content=content, timestamp=timestamp)
+        self.turns.append(turn)
+        
+        # 保持最大輪次限制
+        if len(self.turns) > self.max_turns:
+            self.turns = self.turns[-self.max_turns:]
+    
+    def get_conversation_text(self, user_prefix: str = "用戶：", 
+                            assistant_prefix: str = "長門櫻：") -> str:
+        """獲取格式化的對話文本"""
+        formatted_turns = []
+        for turn in self.turns:
+            if turn.role == "user":
+                formatted_turns.append(f"{user_prefix}{turn.content}")
+            elif turn.role == "assistant":
+                formatted_turns.append(f"{assistant_prefix}{turn.content}")
+        
+        return "\n".join(formatted_turns)
+    
+    def clear(self):
+        """清空對話歷史"""
+        self.turns.clear()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """序列化為字典"""
+        return {
+            "turns": [
+                {
+                    "role": turn.role,
+                    "content": turn.content,
+                    "timestamp": turn.timestamp
+                }
+                for turn in self.turns
+            ],
+            "max_turns": self.max_turns,
+            "max_length": self.max_length
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ConversationHistory':
+        """從字典反序列化"""
+        history = cls(
+            max_turns=data.get("max_turns", 50),
+            max_length=data.get("max_length", 4096)
+        )
+        
+        for turn_data in data.get("turns", []):
+            turn = ConversationTurn(
+                role=turn_data["role"],
+                content=turn_data["content"],
+                timestamp=turn_data.get("timestamp")
+            )
+            history.turns.append(turn)
+        
+        return history
 
 # RMSNorm
 class NSRMSNorm(nn.Module):
@@ -319,6 +398,31 @@ class NSConfig:
     use_stable_embedding: bool = True
     max_grad_norm: float = 1.0
     layer_norm_type: str = "rmsnorm"
+    
+    # 對話相關配置
+    conversation_template: str = "nagato_sakura"  # 對話模板
+    system_message: str = "你是長門櫻，一個友善且樂於助人的AI助手。"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """轉換為字典"""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'NSConfig':
+        """從字典創建配置"""
+        return cls(**config_dict)
+    
+    def save_to_file(self, file_path: Union[str, Path]):
+        """保存配置到文件"""
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+    
+    @classmethod
+    def load_from_file(cls, file_path: Union[str, Path]) -> 'NSConfig':
+        """從文件加載配置"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        return cls.from_dict(config_dict)
 
 # 主模型
 class NagatoSakuraModel(nn.Module):
@@ -623,6 +727,103 @@ class NagatoSakuraForCausalLM(nn.Module):
 
         return outputs
 
+    def prepare_inputs_for_generation(
+        self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, 
+        attention_mask: Optional[torch.Tensor] = None, inputs_embeds: Optional[torch.FloatTensor] = None, **kwargs
+    ) -> Dict[str, Any]:
+        """為生成準備輸入"""
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values: List[Tuple[torch.Tensor, torch.Tensor]], beam_idx: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """重新排序緩存以支持束搜索"""
+        reordered_past = []
+        for layer_past in past_key_values:
+            reordered_past.append(
+                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past)
+            )
+        return reordered_past
+
+    def _apply_generation_config(self, next_token_logits: torch.Tensor, 
+                                 generated_tokens: torch.Tensor,
+                                 temperature: float = 1.0, 
+                                 top_k: int = 50, 
+                                 top_p: float = 1.0,
+                                 repetition_penalty: float = 1.0, 
+                                 do_sample: bool = True) -> torch.Tensor:
+        """使用與舊版本完全相同的生成邏輯"""
+        
+        # 應用重複懲罰 - 只對已生成的token
+        if repetition_penalty != 1.0 and generated_tokens.shape[1] > 0:
+            # 獲取已生成token的分數
+            score = torch.gather(next_token_logits, 1, generated_tokens)
+            # 應用懲罰
+            score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+            # 將懲罰後的分數放回
+            next_token_logits.scatter_(1, generated_tokens, score)
+
+        # 貪婪解碼或採樣
+        if do_sample:
+            # 溫度調節
+            if temperature != 1.0 and temperature > 0:
+                next_token_logits = next_token_logits / temperature
+            
+            # Top-k 過濾
+            if top_k > 0:
+                top_k_actual = min(top_k, next_token_logits.size(-1))
+                top_k_values, top_k_indices = torch.topk(next_token_logits, top_k_actual)
+                next_token_logits = torch.full_like(next_token_logits, float('-inf'))
+                next_token_logits.scatter_(1, top_k_indices, top_k_values)
+            
+            # Top-p 過濾
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits[indices_to_remove] = float('-inf')
+            
+            # 確保至少有一個有效選項
+            if torch.all(torch.isinf(next_token_logits)):
+                # 重置為原始logits
+                next_token_logits = self.lm_head(self.model.final_layernorm(
+                    self.model.embed_tokens(generated_tokens[:, -1:])
+                ))[:, -1, :]
+            
+            # 採樣
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            # 貪婪解碼
+            next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+        return next_tokens
+
     @torch.no_grad()
     def generate(
         self,
@@ -641,9 +842,12 @@ class NagatoSakuraForCausalLM(nn.Module):
         use_cache: bool = True,
         **kwargs
     ) -> torch.LongTensor:
-        """基本生成方法 - 修復版"""
+        """使用舊版本的生成邏輯確保一致性"""
         if input_ids is None:
             raise ValueError("必須提供 input_ids")
+
+        # 確保模型處於評估模式
+        self.eval()
 
         # 獲取配置中的默認值
         pad_token_id = pad_token_id or getattr(self.config, 'pad_token_id', None)
@@ -676,9 +880,6 @@ class NagatoSakuraForCausalLM(nn.Module):
                 # 如果有past_key_values，只使用最後一個token
                 if past_key_values is not None:
                     model_inputs["input_ids"] = input_ids[:, -1:]
-                    if attention_mask is not None:
-                        # attention_mask保持完整長度
-                        pass
 
                 outputs: NagatoSakuraOutput = self(**model_inputs)
 
@@ -687,43 +888,15 @@ class NagatoSakuraForCausalLM(nn.Module):
                 
                 next_token_logits = outputs.logits[:, -1, :]
 
-                # 應用重複懲罰
-                if repetition_penalty != 1.0:
-                    if input_ids.shape[1] > 0:
-                        score = torch.gather(next_token_logits, 1, input_ids)
-                        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
-                        next_token_logits.scatter_(1, input_ids, score)
-
-                # 貪婪解碼或採樣
-                if do_sample:
-                    if temperature != 1.0 and temperature > 0:
-                        next_token_logits = next_token_logits / temperature
-                    
-                    # Top-k 過濾
-                    if top_k > 0:
-                        top_k_actual = min(top_k, next_token_logits.size(-1))
-                        top_k_values, top_k_indices = torch.topk(next_token_logits, top_k_actual)
-                        next_token_logits = torch.full_like(next_token_logits, float('-inf'))
-                        next_token_logits.scatter_(1, top_k_indices, top_k_values)
-                    
-                    # Top-p 過濾
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                        next_token_logits[indices_to_remove] = float('-inf')
-                    
-                    # 確保至少有一個有效選項
-                    if torch.all(torch.isinf(next_token_logits)):
-                        next_token_logits = outputs.logits[:, -1, :]
-                    
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                else:
-                    next_tokens = torch.argmax(next_token_logits, dim=-1)
+                # 使用舊版本的生成邏輯
+                next_tokens = self._apply_generation_config(
+                    next_token_logits, input_ids,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    do_sample=do_sample
+                )
 
                 # 添加新令牌到序列
                 next_tokens = next_tokens.unsqueeze(-1)
@@ -756,6 +929,283 @@ class NagatoSakuraForCausalLM(nn.Module):
             input_ids = torch.cat([input_ids, padding], dim=1)
 
         return input_ids
+
+    @torch.no_grad()
+    def stream_generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 512,
+        min_new_tokens: int = 1,
+        do_sample: bool = True,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        stop_strings: Optional[List[str]] = None,
+        **kwargs
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        流式生成，使用與generate()完全相同的邏輯
+        """
+        if input_ids is None:
+            raise ValueError("必須提供 input_ids")
+        
+        # 確保模型處於評估模式
+        self.eval()
+        
+        # 初始化
+        batch_size, input_length = input_ids.shape
+        device = input_ids.device
+        
+        # 獲取特殊token
+        pad_token_id = getattr(self.config, 'pad_token_id', None)
+        eos_token_id = getattr(self.config, 'eos_token_id', None)
+        
+        # 初始化注意力掩碼
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        
+        # 初始化生成狀態
+        generated_ids = input_ids.clone()
+        past_key_values = None
+        tokens_generated = 0
+        
+        # 初始狀態輸出
+        yield {
+            "token_id": None,
+            "token_text": "",
+            "generated_text": "",
+            "finished": False,
+            "stop_reason": None,
+            "tokens_generated": 0,
+            "input_length": input_length
+        }
+        
+        # 生成循環
+        for step in range(max_new_tokens):
+            try:
+                # 準備輸入
+                model_inputs = {
+                    "input_ids": generated_ids,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                }
+                
+                # 如果有past_key_values，只使用最後一個token
+                if past_key_values is not None:
+                    model_inputs["input_ids"] = generated_ids[:, -1:]
+                
+                # 前向傳播
+                with torch.no_grad():
+                    outputs = self(**model_inputs)
+                
+                if outputs.logits is None:
+                    break
+                
+                # 獲取下一個token的logits
+                next_token_logits = outputs.logits[:, -1, :]
+                
+                # 使用與generate()完全相同的生成邏輯
+                # 只對新生成的部分應用重複懲罰
+                generated_tokens_only = generated_ids[:, input_length:] if generated_ids.shape[1] > input_length else torch.empty((batch_size, 0), device=device, dtype=torch.long)
+                
+                next_token = self._apply_generation_config(
+                    next_token_logits, generated_tokens_only,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    do_sample=do_sample
+                )
+                
+                next_token = next_token.unsqueeze(-1)
+                
+                # 更新生成序列
+                generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+                tokens_generated += 1
+                
+                # 更新注意力掩碼
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    torch.ones((batch_size, 1), device=device, dtype=attention_mask.dtype)
+                ], dim=-1)
+                
+                # 更新緩存
+                past_key_values = outputs.past_key_values
+                
+                # 檢查停止條件
+                stop_reason = None
+                should_stop = False
+                
+                # 檢查EOS token
+                if eos_token_id is not None and next_token.item() == eos_token_id:
+                    should_stop = True
+                    stop_reason = "eos_token"
+                
+                # 檢查最大長度
+                elif tokens_generated >= max_new_tokens:
+                    should_stop = True
+                    stop_reason = "max_length"
+                
+                # 檢查最小長度
+                if tokens_generated < min_new_tokens:
+                    should_stop = False
+                
+                # 返回當前狀態
+                yield {
+                    "token_id": next_token.item(),
+                    "token_text": "",  # 需要tokenizer來解碼
+                    "generated_text": "",  # 需要tokenizer來解碼完整文本
+                    "finished": should_stop,
+                    "stop_reason": stop_reason,
+                    "tokens_generated": tokens_generated,
+                    "input_length": input_length,
+                    "generated_ids": generated_ids.clone()  # 提供完整的生成序列
+                }
+                
+                if should_stop:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"流式生成過程中出錯: {e}")
+                yield {
+                    "token_id": None,
+                    "token_text": "",
+                    "generated_text": "",
+                    "finished": True,
+                    "stop_reason": "error",
+                    "tokens_generated": tokens_generated,
+                    "input_length": input_length,
+                    "error": str(e)
+                }
+                break
+        
+        # 確保最終狀態被標記為完成
+        if tokens_generated > 0:
+            yield {
+                "token_id": None,
+                "token_text": "",
+                "generated_text": "",
+                "finished": True,
+                "stop_reason": stop_reason or "completed",
+                "tokens_generated": tokens_generated,
+                "input_length": input_length,
+                "generated_ids": generated_ids
+            }
+
+    def chat_stream(
+        self,
+        tokenizer,
+        query: str,
+        history: Optional[ConversationHistory] = None,
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.1,
+        system_message: Optional[str] = None,
+        **kwargs
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        對話流式生成 - 修復版
+        """
+        # 確保模型處於評估模式
+        self.eval()
+        
+        # 初始化對話歷史
+        if history is None:
+            history = ConversationHistory()
+        
+        # 添加用戶輸入到歷史
+        history.add_turn("user", query)
+        
+        # 構建對話文本
+        system_msg = system_message or getattr(self.config, 'system_message', "")
+        conversation_text = ""
+        
+        if system_msg:
+            conversation_text += f"系統：{system_msg}\n"
+        
+        conversation_text += history.get_conversation_text()
+        conversation_text += "\n長門櫻："
+        
+        # 編碼輸入
+        try:
+            input_ids = tokenizer.encode(
+                conversation_text, 
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.config.max_position_embeddings - max_new_tokens
+            ).to(next(self.parameters()).device)
+            
+            # 創建注意力掩碼
+            attention_mask = torch.ones_like(input_ids)
+            
+        except Exception as e:
+            yield {
+                "delta": "",
+                "response": "",
+                "finished": True,
+                "error": f"輸入編碼失敗: {e}"
+            }
+            return
+        
+        # 初始化響應
+        full_response = ""
+        
+        # 流式生成
+        for output in self.stream_generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            **kwargs
+        ):
+            if output.get("finished", False):
+                # 生成完成，添加到歷史
+                if full_response.strip():
+                    history.add_turn("assistant", full_response.strip())
+                
+                yield {
+                    "delta": "",
+                    "response": full_response,
+                    "finished": True,
+                    "stop_reason": output.get("stop_reason"),
+                    "history": history,
+                    "tokens_generated": output.get("tokens_generated", 0)
+                }
+                break
+            
+            # 解碼新token
+            if "generated_ids" in output and output["generated_ids"] is not None:
+                try:
+                    # 只解碼新生成的部分
+                    new_tokens = output["generated_ids"][:, input_ids.shape[1]:]
+                    if new_tokens.shape[1] > 0:
+                        new_text = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+                        
+                        # 計算增量
+                        if len(new_text) > len(full_response):
+                            delta = new_text[len(full_response):]
+                            full_response = new_text
+                        else:
+                            delta = ""
+                        
+                        yield {
+                            "delta": delta,
+                            "response": full_response,
+                            "finished": False,
+                            "tokens_generated": output.get("tokens_generated", 0)
+                        }
+                    
+                except Exception as e:
+                    logger.warning(f"解碼token時出錯: {e}")
+                    continue
 
 # 輔助函數
 def _make_causal_mask(

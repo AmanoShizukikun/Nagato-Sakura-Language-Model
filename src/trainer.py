@@ -46,7 +46,7 @@ except ImportError:
 
 
 class AdvancedNagatoSakuraTrainer:
-    """長門櫻訓練器"""
+    """高級長門櫻訓練器，參考ChatGLM訓練標準"""
     
     def __init__(self, model_config: Optional[NSConfig], output_dir: str = "nagato_sakura_output",
                  device: Optional[str] = None, use_wandb: bool = False, project_name: str = "nagato-sakura"):
@@ -245,7 +245,7 @@ class AdvancedNagatoSakuraTrainer:
         optimizer = AdamW(
             optimizer_grouped_parameters,
             lr=learning_rate,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.95),  # ChatGLM風格的betas
             eps=1e-8,
             weight_decay=weight_decay
         )
