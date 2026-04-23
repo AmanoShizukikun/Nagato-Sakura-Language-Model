@@ -736,6 +736,175 @@ def convert_taiwanchat(
         return False, 0, 0
 
 
+def convert_fineweb_edu_chinese_sft_split(
+    input_path: Path,
+    output_dir: Optional[Path] = None,
+    opencc_config: str = "s2twp",
+) -> Tuple[bool, int, int]:
+    """
+    將 Fineweb-Edu-Chinese-sft-cleaned-V2.2 逐檔轉為 instruction/input/output（繁體）。
+
+    輸出檔名格式：fineweb-edu-chinese-sft-cleaned-V2.2-<編號>.json
+
+    Returns:
+        (success, source_file_count, converted_count)
+    """
+    if not input_path.exists():
+        print(f"錯誤：找不到輸入路徑 {input_path}")
+        return False, 0, 0
+
+    if output_dir is None:
+        output_dir = input_path if input_path.is_dir() else input_path.parent
+
+    if input_path.is_file():
+        source_files = [input_path]
+    else:
+        source_files = sorted(input_path.glob("*.jsonl"))
+        if not source_files:
+            source_files = sorted(input_path.glob("*.json"))
+
+    source_files = [
+        fp
+        for fp in source_files
+        if not fp.name.lower().startswith("fineweb-edu-chinese-sft-cleaned-v2.2-")
+    ]
+    if not source_files:
+        print("❌ 找不到可轉換的來源檔案（jsonl/json）")
+        return False, 0, 0
+
+    normalized_config = _normalize_opencc_config(opencc_config)
+    try:
+        converter = OpenCC(normalized_config)
+    except Exception as exc:
+        print(f"❌ OpenCC 初始化失敗 ({normalized_config})：{exc}")
+        return False, 0, 0
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        converted_count = 0
+
+        for index, source_file in enumerate(source_files, start=1):
+            rows = _load_rows_from_file(source_file)
+            converted_data: List[Dict[str, str]] = []
+
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+
+                instruction = _safe_text(
+                    item.get("instruction") or item.get("query") or item.get("prompt")
+                ).strip()
+                input_text = _safe_text(item.get("input") or item.get("context")).strip()
+                output = _safe_text(
+                    item.get("output") or item.get("response") or item.get("completion")
+                ).strip()
+
+                if not instruction or not output:
+                    continue
+
+                converted_data.append(
+                    {
+                        "instruction": converter.convert(instruction),
+                        "input": converter.convert(input_text),
+                        "output": converter.convert(output),
+                    }
+                )
+
+            numeric_match = re.search(r"(\d+)$", source_file.stem)
+            file_id = numeric_match.group(1) if numeric_match else str(index)
+            output_file = output_dir / f"fineweb-edu-chinese-sft-cleaned-V2.2-{file_id}.json"
+
+            _write_json(output_file, converted_data)
+            converted_count += len(converted_data)
+            print(f"✅ {source_file.name} -> {output_file.name}（{len(converted_data)} 筆）")
+
+        print("✅ 轉換完成！")
+        print(f"來源檔案數量：{len(source_files)}")
+        print(f"轉換後樣本總數：{converted_count}")
+        print(f"輸出資料夾：{output_dir}")
+        return True, len(source_files), converted_count
+    except Exception as exc:
+        print(f"❌ 轉換過程中發生錯誤：{exc}")
+        return False, 0, 0
+
+
+def convert_codex_7m_non_thinking_split(
+    input_path: Path,
+    output_dir: Optional[Path] = None,
+) -> Tuple[bool, int, int]:
+    """
+    將 CodeX-7M-Non-Thinking 逐檔轉為 instruction/input/output。
+
+    輸出檔名格式：codex-7m-<編號>.json
+
+    Returns:
+        (success, source_file_count, converted_count)
+    """
+    if not input_path.exists():
+        print(f"錯誤：找不到輸入路徑 {input_path}")
+        return False, 0, 0
+
+    if output_dir is None:
+        output_dir = input_path if input_path.is_dir() else input_path.parent
+
+    if input_path.is_file():
+        source_files = [input_path]
+    else:
+        source_files = sorted(input_path.glob("*.parquet"))
+
+    source_files = [
+        fp
+        for fp in source_files
+        if not fp.name.lower().startswith("codex-7m-")
+    ]
+    if not source_files:
+        print("❌ 找不到可轉換的來源檔案（parquet）")
+        return False, 0, 0
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        converted_count = 0
+
+        for index, source_file in enumerate(source_files, start=1):
+            rows = _load_rows_from_file(source_file)
+            converted_data: List[Dict[str, str]] = []
+
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+
+                instruction = _safe_text(item.get("input") or item.get("instruction") or item.get("query") or item.get("prompt")).strip()
+                output = _safe_text(item.get("output") or item.get("response") or item.get("completion")).strip()
+
+                if not instruction or not output:
+                    continue
+
+                converted_data.append(
+                    {
+                        "instruction": instruction,
+                        "input": "",
+                        "output": output,
+                    }
+                )
+
+            numeric_match = re.search(r"(\d+)$", source_file.stem)
+            file_id = numeric_match.group(1) if numeric_match else str(index).zfill(3)
+            output_file = output_dir / f"codex-7m-{file_id}.json"
+
+            _write_json(output_file, converted_data)
+            converted_count += len(converted_data)
+            print(f"✅ {source_file.name} -> {output_file.name}（{len(converted_data)} 筆）")
+
+        print("✅ 轉換完成！")
+        print(f"來源檔案數量：{len(source_files)}")
+        print(f"轉換後樣本總數：{converted_count}")
+        print(f"輸出資料夾：{output_dir}")
+        return True, len(source_files), converted_count
+    except Exception as exc:
+        print(f"❌ 轉換過程中發生錯誤：{exc}")
+        return False, 0, 0
+
+
 def _extract_from_alpaca_prompt(prompt_text: str) -> Tuple[str, str, str]:
     if not prompt_text or not isinstance(prompt_text, str):
         return "", "", ""
@@ -849,9 +1018,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["alpaca", "legacy", "twllm", "codefeedback", "python18k", "stablecode", "chatmed", "taiwanchat"],
+        choices=["alpaca", "legacy", "twllm", "codefeedback", "python18k", "stablecode", "chatmed", "taiwanchat", "finewebsplit", "codex7msplit"],
         default="alpaca",
-        help="alpaca: 產生 en.json/zh.json；legacy: 轉換 prompt/completion；twllm: conversations 轉 instruction/input/output；codefeedback: query/response 轉 instruction/input/output；python18k: python_code_instructions_18k_alpaca 轉 instruction/input/output；stablecode: Stable-Code-Python-SFT 轉 instruction/input/output；chatmed: ChatMed_Consult_Dataset 轉 instruction/input/output；taiwanchat: TaiwanChat 轉 instruction/input/output",
+        help="alpaca: 產生 en.json/zh.json；legacy: 轉換 prompt/completion；twllm: conversations 轉 instruction/input/output；codefeedback: query/response 轉 instruction/input/output；python18k: python_code_instructions_18k_alpaca 轉 instruction/input/output；stablecode: Stable-Code-Python-SFT 轉 instruction/input/output；chatmed: ChatMed_Consult_Dataset 轉 instruction/input/output；taiwanchat: TaiwanChat 轉 instruction/input/output；finewebsplit: Fineweb-Edu-Chinese-sft-cleaned-V2.2 逐檔轉繁體並輸出多個 JSON；codex7msplit: CodeX-7M-Non-Thinking 逐檔轉 instruction/input/output",
     )
     parser.add_argument(
         "--en-output",
@@ -980,6 +1149,33 @@ def main() -> None:
             print("\n🎉 轉換成功完成！")
             print(f"原始樣本數量：{src_count}")
             print(f"轉換後樣本數量：{converted_count}")
+        else:
+            print("\n❌ 轉換失敗！")
+        return
+
+    if args.mode == "finewebsplit":
+        success, src_count, converted_count = convert_fineweb_edu_chinese_sft_split(
+            input_path=args.input,
+            output_dir=args.output,
+            opencc_config=args.opencc_config,
+        )
+        if success:
+            print("\n🎉 轉換成功完成！")
+            print(f"來源檔案數量：{src_count}")
+            print(f"轉換後樣本總數：{converted_count}")
+        else:
+            print("\n❌ 轉換失敗！")
+        return
+
+    if args.mode == "codex7msplit":
+        success, src_count, converted_count = convert_codex_7m_non_thinking_split(
+            input_path=args.input,
+            output_dir=args.output,
+        )
+        if success:
+            print("\n🎉 轉換成功完成！")
+            print(f"來源檔案數量：{src_count}")
+            print(f"轉換後樣本總數：{converted_count}")
         else:
             print("\n❌ 轉換失敗！")
         return

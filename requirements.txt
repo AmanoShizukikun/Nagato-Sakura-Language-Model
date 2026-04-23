@@ -1,0 +1,8 @@
+transformers
+datasets
+psutil
+GPUtil
+tqdm
+wandb
+flask
+openai-whisper

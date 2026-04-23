@@ -5,6 +5,7 @@ import time
 import warnings
 import math
 import logging
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from functools import partial
@@ -186,6 +187,7 @@ class AdvancedNagatoSakuraTrainer:
         self._scheduler_total_steps: Optional[int] = None
         self._scheduler_warmup_steps: Optional[int] = None
         self._scheduler_step_offset: int = 0
+        self._last_resume_scheduler_alignment_reasons: List[str] = []
         best_model_dir = self.output_dir / "best_model"
         if (best_model_dir / "model.pt").exists():
             self.best_checkpoint_path = best_model_dir
@@ -517,6 +519,19 @@ class AdvancedNagatoSakuraTrainer:
             )
             self._align_scheduler_to_global_step(scheduler, reason="step_mismatch")
 
+    @staticmethod
+    def _compute_file_sha256(file_path: Path) -> Optional[str]:
+        if not file_path.exists() or not file_path.is_file():
+            return None
+
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def initialize_model(self):
         """初始化模型"""
         if self.model_config is None:
@@ -525,7 +540,7 @@ class AdvancedNagatoSakuraTrainer:
             raise ValueError("分詞器未初始化")
         
         # 更新配置
-        self.model_config.vocab_size = self.tokenizer_manager.transformers_tokenizer.vocab_size
+        self.model_config.vocab_size = len(self.tokenizer_manager.transformers_tokenizer)
         self.model_config.pad_token_id = self.tokenizer_manager.transformers_tokenizer.pad_token_id
         self.model_config.bos_token_id = self.tokenizer_manager.transformers_tokenizer.bos_token_id
         self.model_config.eos_token_id = self.tokenizer_manager.transformers_tokenizer.eos_token_id
@@ -765,6 +780,8 @@ class AdvancedNagatoSakuraTrainer:
         eval_data_file: Optional[str] = None,
         tokenizer_train_max_samples: int = 0,
         tokenizer_num_threads: int = 0,
+        tokenizer_enable_universal_charset: bool = True,
+        tokenizer_extra_chars_files: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, str]], Optional[List[Dict[str, str]]]]:
         """準備訓練/評估數據並訓練分詞器。"""
 
@@ -804,6 +821,8 @@ class AdvancedNagatoSakuraTrainer:
             min_frequency=tokenizer_min_frequency,
             max_training_samples=tokenizer_train_max_samples,
             num_threads=tokenizer_num_threads,
+            enable_universal_charset=tokenizer_enable_universal_charset,
+            extra_chars_files=tokenizer_extra_chars_files,
         )
 
         return train_data, fixed_eval_data
@@ -817,6 +836,8 @@ class AdvancedNagatoSakuraTrainer:
         pretokenize_batch_size: int = 1024,
         pretokenize_num_proc: Optional[int] = None,
         use_pretokenize_cache: bool = True,
+        fail_on_unk_tokens: bool = False,
+        unk_audit_max_samples: int = 4096,
     ) -> Tuple[Dataset, Optional[Dataset]]:
         """創建訓練和評估數據集"""
         
@@ -829,6 +850,28 @@ class AdvancedNagatoSakuraTrainer:
             raise ValueError("分詞器尚未初始化")
         if self.model_config is None:
             raise ValueError("模型配置尚未初始化")
+
+        unk_audit_max_samples = max(1, int(unk_audit_max_samples))
+
+        def _finalize_datasets(
+            train_dataset: Dataset,
+            eval_dataset: Optional[Dataset],
+            stage_name: str,
+        ) -> Tuple[Dataset, Optional[Dataset]]:
+            self._audit_dataset_unk_tokens(
+                train_dataset,
+                dataset_name=f"{stage_name}/train",
+                max_samples=unk_audit_max_samples,
+                fail_on_unk=bool(fail_on_unk_tokens),
+            )
+            if eval_dataset is not None:
+                self._audit_dataset_unk_tokens(
+                    eval_dataset,
+                    dataset_name=f"{stage_name}/eval",
+                    max_samples=unk_audit_max_samples,
+                    fail_on_unk=bool(fail_on_unk_tokens),
+                )
+            return train_dataset, eval_dataset
 
         if not bool(enable_pretokenize):
             self.logger.info("Pretokenize 設定 - 停用（改為訓練時即時分詞）")
@@ -843,7 +886,7 @@ class AdvancedNagatoSakuraTrainer:
                 self.logger.info(
                     f"使用固定評估集(即時分詞) - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
                 )
-                return train_dataset, eval_dataset
+                return _finalize_datasets(train_dataset, eval_dataset, "online_tokenize_fixed_eval")
 
             dataset = Dataset.from_list(data_list)
             if eval_split_ratio > 0 and eval_split_ratio < 1.0 and len(dataset) > 1:
@@ -857,10 +900,10 @@ class AdvancedNagatoSakuraTrainer:
                 self.logger.info(
                     f"數據集分割完成(即時分詞) - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
                 )
-                return train_dataset, eval_dataset
+                return _finalize_datasets(train_dataset, eval_dataset, "online_tokenize_split")
 
             self.logger.info(f"使用完整數據集進行訓練(即時分詞): {len(dataset)}")
-            return dataset, None
+            return _finalize_datasets(dataset, None, "online_tokenize_full")
 
         tokenizer = self.tokenizer_manager.transformers_tokenizer
         max_seq_length = self.model_config.max_position_embeddings
@@ -880,8 +923,12 @@ class AdvancedNagatoSakuraTrainer:
         tokenizer_path = self.tokenizer_manager.tokenizer_path
         tokenizer_stamp = "missing"
         if tokenizer_path.exists():
-            stat = tokenizer_path.stat()
-            tokenizer_stamp = f"{stat.st_size}-{stat.st_mtime_ns}"
+            tokenizer_hash = self._compute_file_sha256(tokenizer_path)
+            if tokenizer_hash:
+                tokenizer_stamp = f"sha256-{tokenizer_hash[:16]}"
+            else:
+                stat = tokenizer_path.stat()
+                tokenizer_stamp = f"{stat.st_size}-{stat.st_mtime_ns}"
 
         cache_root = self.output_dir / "cache" / "pretokenized"
         self.logger.info(
@@ -925,7 +972,7 @@ class AdvancedNagatoSakuraTrainer:
             self.logger.info(
                 f"使用固定評估集 - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}"
             )
-            return train_dataset, eval_dataset
+            return _finalize_datasets(train_dataset, eval_dataset, "pretokenize_fixed_eval")
         
         # 創建完整數據集
         dataset = Dataset.from_list(data_list)
@@ -949,11 +996,113 @@ class AdvancedNagatoSakuraTrainer:
             )
             
             self.logger.info(f"數據集分割完成 - 訓練集: {len(train_dataset)}, 評估集: {len(eval_dataset)}")
-            return train_dataset, eval_dataset
+            return _finalize_datasets(train_dataset, eval_dataset, "pretokenize_split")
         else:
             train_dataset = _pretokenize_rows(data_list, "Pretokenize train", "train")
             self.logger.info(f"使用完整數據集進行訓練: {len(train_dataset)}")
-            return train_dataset, None
+            return _finalize_datasets(train_dataset, None, "pretokenize_full")
+
+    def _audit_dataset_unk_tokens(
+        self,
+        dataset: Dataset,
+        dataset_name: str,
+        max_samples: int = 4096,
+        fail_on_unk: bool = False,
+    ) -> None:
+        tokenizer = self.tokenizer_manager.transformers_tokenizer
+        if tokenizer is None:
+            return
+
+        unk_token_id = tokenizer.unk_token_id
+        if unk_token_id is None:
+            self.logger.warning(f"{dataset_name} <unk> 掃描略過：tokenizer.unk_token_id 為 None")
+            return
+
+        if "input_ids" not in dataset.column_names:
+            self.logger.info(f"{dataset_name} 為即時分詞資料集，略過 <unk> 掃描。")
+            return
+
+        total_samples = int(len(dataset))
+        if total_samples <= 0:
+            return
+
+        max_samples = max(1, int(max_samples))
+        target_samples = min(total_samples, max_samples)
+        sample_stride = max(1, total_samples // target_samples)
+
+        scanned_samples = 0
+        scanned_tokens = 0
+        unk_hits = 0
+        samples_with_unk = 0
+        example_indices: List[int] = []
+
+        for idx in range(0, total_samples, sample_stride):
+            if scanned_samples >= target_samples:
+                break
+
+            row = dataset[int(idx)]
+            input_ids = row.get("input_ids")
+            if not isinstance(input_ids, list):
+                continue
+
+            scanned_samples += 1
+            scanned_tokens += len(input_ids)
+            row_unk_hits = sum(1 for token_id in input_ids if int(token_id) == int(unk_token_id))
+
+            if row_unk_hits > 0:
+                samples_with_unk += 1
+                unk_hits += row_unk_hits
+                if len(example_indices) < 5:
+                    example_indices.append(int(idx))
+
+        if scanned_samples <= 0:
+            self.logger.warning(f"{dataset_name} <unk> 掃描失敗：未找到可用 input_ids。")
+            return
+
+        token_hit_ratio = float(unk_hits / max(1, scanned_tokens))
+        sample_hit_ratio = float(samples_with_unk / max(1, scanned_samples))
+
+        if unk_hits <= 0:
+            self.logger.info(
+                f"{dataset_name} <unk> 掃描: 0 命中（檢查樣本 {scanned_samples}/{total_samples}, token {scanned_tokens}）"
+            )
+            return
+
+        self.logger.warning(
+            f"{dataset_name} <unk> 掃描: 命中 {unk_hits}/{scanned_tokens} ({token_hit_ratio:.6%}), "
+            f"含 <unk> 樣本 {samples_with_unk}/{scanned_samples} ({sample_hit_ratio:.2%}), "
+            f"例子索引: {example_indices}"
+        )
+
+        self.metrics_writer.log_event(
+            {
+                "epoch": self.current_epoch,
+                "global_step": self.global_step,
+                "event_type": "unk_token_detected",
+                "severity": "WARNING",
+                "message": f"<unk> detected during dataset audit ({dataset_name})",
+                "value": json.dumps(
+                    {
+                        "dataset": dataset_name,
+                        "scanned_samples": scanned_samples,
+                        "total_samples": total_samples,
+                        "scanned_tokens": scanned_tokens,
+                        "unk_hits": unk_hits,
+                        "token_hit_ratio": token_hit_ratio,
+                        "sample_hit_ratio": sample_hit_ratio,
+                        "example_indices": example_indices,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        if bool(fail_on_unk):
+            raise ValueError(
+                f"{dataset_name} 偵測到 <unk> token，已中止訓練。"
+                "請使用 --force_retrain_tokenizer --no_resume 重新建立 tokenizer，"
+                "或檢查資料編碼是否正確。"
+            )
 
     def setup_training_components(
         self,
@@ -1588,10 +1737,18 @@ class AdvancedNagatoSakuraTrainer:
             # 分詞器
             if self.tokenizer_manager.tokenizer_object:
                 self.tokenizer_manager.tokenizer_object.save(str(checkpoint_dir / "tokenizer.json"))
+
+            checkpoint_tokenizer_path = checkpoint_dir / "tokenizer.json"
+            tokenizer_sha256 = self._compute_file_sha256(checkpoint_tokenizer_path)
+            tokenizer_vocab_size = (
+                int(len(self.tokenizer_manager.transformers_tokenizer))
+                if self.tokenizer_manager.transformers_tokenizer is not None
+                else None
+            )
             
             # 訓練狀態
             training_state = {
-                'epoch': self.current_epoch,
+                'epoch': self.current_epoch + 1,  # 儲存「下次應從哪個 epoch 開始」(0-indexed)，避免 resume 時重跑同一 epoch
                 'global_step': self.global_step,
                 'best_eval_loss': self.best_eval_loss,
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -1599,7 +1756,9 @@ class AdvancedNagatoSakuraTrainer:
                 'scheduler_total_steps': self._scheduler_total_steps,
                 'scheduler_warmup_steps': self._scheduler_warmup_steps,
                 'scheduler_step_offset': self._scheduler_step_offset,
-                'training_history': dict(self.training_history)
+                'training_history': dict(self.training_history),
+                'tokenizer_sha256': tokenizer_sha256,
+                'tokenizer_vocab_size': tokenizer_vocab_size,
             }
             
             if scaler and scaler.is_enabled():
@@ -1633,8 +1792,8 @@ class AdvancedNagatoSakuraTrainer:
             self.logger.error(f"保存檢查點失敗: {e}")
             return None
 
-    def load_checkpoint(self, checkpoint_dir: str, optimizer, scheduler, 
-                       scaler: Optional[GradScaler] = None) -> bool:
+    def load_checkpoint(self, checkpoint_dir: str, optimizer, scheduler,
+                       scaler: Optional[GradScaler] = None, restore_training_state: bool = True) -> bool:
         """加載檢查點"""
         checkpoint_path = Path(checkpoint_dir)
         if not checkpoint_path.exists():
@@ -1642,14 +1801,98 @@ class AdvancedNagatoSakuraTrainer:
             return False
         
         try:
+            checkpoint_tokenizer_path = checkpoint_path / "tokenizer.json"
+            current_tokenizer_path = self.tokenizer_manager.tokenizer_path
+            checkpoint_tokenizer_hash = self._compute_file_sha256(checkpoint_tokenizer_path)
+            current_tokenizer_hash = self._compute_file_sha256(current_tokenizer_path)
+
+            if checkpoint_tokenizer_hash and current_tokenizer_hash:
+                if checkpoint_tokenizer_hash != current_tokenizer_hash:
+                    self.logger.error(
+                        "檢查點 tokenizer 與當前 output tokenizer 不一致，為避免詞表語義錯位，已拒絕恢復。"
+                    )
+                    self.logger.error(
+                        f"checkpoint tokenizer: {checkpoint_tokenizer_path}, sha256={checkpoint_tokenizer_hash}"
+                    )
+                    self.logger.error(
+                        f"current tokenizer: {current_tokenizer_path}, sha256={current_tokenizer_hash}"
+                    )
+                    self.logger.error("請改用 --no_resume 開新 run（並搭配 --force_retrain_tokenizer）。")
+                    return False
+
+            checkpoint_vocab_size: Optional[int] = None
+            checkpoint_config_path = checkpoint_path / "config.json"
+            if checkpoint_config_path.exists():
+                try:
+                    with open(checkpoint_config_path, "r", encoding="utf-8") as f:
+                        checkpoint_config = json.load(f)
+                    raw_vocab = checkpoint_config.get("vocab_size")
+                    if raw_vocab is not None:
+                        checkpoint_vocab_size = int(raw_vocab)
+                except Exception as e:
+                    self.logger.warning(f"讀取 checkpoint config 失敗，跳過 vocab 比對: {e}")
+
+            current_vocab_size: Optional[int] = None
+            if self.tokenizer_manager.transformers_tokenizer is not None:
+                current_vocab_size = int(len(self.tokenizer_manager.transformers_tokenizer))
+            elif self.model_config is not None:
+                current_vocab_size = int(self.model_config.vocab_size)
+
+            if (
+                checkpoint_vocab_size is not None
+                and current_vocab_size is not None
+                and checkpoint_vocab_size != current_vocab_size
+            ):
+                self.logger.error(
+                    f"checkpoint vocab_size({checkpoint_vocab_size}) 與當前 tokenizer vocab_size({current_vocab_size}) 不一致，"
+                    "已拒絕恢復。"
+                )
+                self.logger.error("請改用 --no_resume 開新 run（並搭配 --force_retrain_tokenizer）。")
+                return False
+
+            self._last_resume_scheduler_alignment_reasons = []
+
             # 加載訓練狀態
             state_path = checkpoint_path / "training_state.pt"
-            if state_path.exists():
+            if restore_training_state and state_path.exists():
                 state = torch.load(state_path, map_location=self.device)
                 self.current_epoch = state.get('epoch', 0)
                 self.global_step = state.get('global_step', 0)
                 self.best_eval_loss = state.get('best_eval_loss', float('inf'))
                 self.training_history = defaultdict(list, state.get('training_history', {}))
+
+                # 向下相容偵測：
+                # 舊格式：epoch 存的是 0-indexed 的已完成 epoch（如 Epoch 2 完成 → 存 1）
+                # 新格式：epoch 存的是下次應從哪個 epoch 開始（如 Epoch 2 完成 → 存 2）
+                # 判斷方式：若 checkpoint 資料夾名為 checkpoint-epoch-N，
+                #           且 saved_epoch == N - 1，則為舊格式，自動修正 +1
+                ckpt_epoch_from_name = CheckpointManager._parse_epoch_from_name(checkpoint_path.name)
+                if ckpt_epoch_from_name is not None and self.current_epoch == ckpt_epoch_from_name - 1:
+                    self.current_epoch += 1
+                    self.logger.info(
+                        f"偵測到舊版 checkpoint 格式（epoch 欄位為 0-indexed）："
+                        f" 已自動將 resume epoch 從 {self.current_epoch - 1} 修正為 {self.current_epoch}"
+                    )
+
+                state_tokenizer_hash = state.get("tokenizer_sha256")
+                if state_tokenizer_hash and checkpoint_tokenizer_hash and state_tokenizer_hash != checkpoint_tokenizer_hash:
+                    self.logger.warning(
+                        "training_state 記錄的 tokenizer hash 與 checkpoint tokenizer 檔案不一致，"
+                        "請確認檔案是否被外部修改。"
+                    )
+
+                state_tokenizer_vocab = state.get("tokenizer_vocab_size")
+                if (
+                    state_tokenizer_vocab is not None
+                    and current_vocab_size is not None
+                    and int(state_tokenizer_vocab) != int(current_vocab_size)
+                ):
+                    self.logger.error(
+                        f"training_state tokenizer_vocab_size({state_tokenizer_vocab}) 與當前 tokenizer vocab_size({current_vocab_size}) 不一致，"
+                        "已拒絕恢復。"
+                    )
+                    self.logger.error("請改用 --no_resume 開新 run（並搭配 --force_retrain_tokenizer）。")
+                    return False
 
                 optimizer_state = state.get('optimizer_state_dict')
                 if optimizer_state is not None:
@@ -1702,18 +1945,48 @@ class AdvancedNagatoSakuraTrainer:
                 else:
                     self._verify_scheduler_alignment(scheduler)
 
+                self._last_resume_scheduler_alignment_reasons = list(scheduler_alignment_reasons)
+
                 if scaler and 'scaler_state_dict' in state:
                     scaler.load_state_dict(state['scaler_state_dict'])
+            elif restore_training_state:
+                self.logger.warning("檢查點缺少 training_state.pt，將僅恢復模型權重")
+            else:
+                self.logger.info("已啟用 model-only 恢復：略過 optimizer/scheduler/scaler 與 step/epoch 狀態")
             
             # 加載模型
             model_path = checkpoint_path / "model.pt"
             if model_path.exists():
                 model_to_load = self._unwrap_model()
-                model_to_load.load_state_dict(torch.load(model_path, map_location=self.device))
+                state_dict = torch.load(model_path, map_location=self.device)
+
+                checkpoint_embed = state_dict.get("model.embed_tokens.weight")
+                checkpoint_lm_head = state_dict.get("lm_head.weight")
+
+                current_embed_shape = tuple(model_to_load.model.embed_tokens.weight.shape)
+                current_lm_head_shape = tuple(model_to_load.lm_head.weight.shape)
+
+                if checkpoint_embed is not None and tuple(checkpoint_embed.shape) != current_embed_shape:
+                    self.logger.error(
+                        f"checkpoint embed_tokens shape={tuple(checkpoint_embed.shape)} 與當前模型 shape={current_embed_shape} 不一致，"
+                        "已拒絕恢復。"
+                    )
+                    self.logger.error("請改用 --no_resume 開新 run（並搭配 --force_retrain_tokenizer）。")
+                    return False
+
+                if checkpoint_lm_head is not None and tuple(checkpoint_lm_head.shape) != current_lm_head_shape:
+                    self.logger.error(
+                        f"checkpoint lm_head shape={tuple(checkpoint_lm_head.shape)} 與當前模型 shape={current_lm_head_shape} 不一致，"
+                        "已拒絕恢復。"
+                    )
+                    self.logger.error("請改用 --no_resume 開新 run（並搭配 --force_retrain_tokenizer）。")
+                    return False
+
+                model_to_load.load_state_dict(state_dict)
                 self.best_checkpoint_path = checkpoint_path
             
             self.logger.info(f"檢查點加載成功: {checkpoint_dir}")
-            self.logger.info(f"恢復至 Epoch {self.current_epoch}, Step {self.global_step}")
+            self.logger.info(f"檢查點已完成 Epoch {self.current_epoch}, Step {self.global_step}，將從 Epoch {self.current_epoch + 1} 繼續訓練")
             if self.is_distributed:
                 dist.barrier()
             return True
@@ -1876,6 +2149,7 @@ class AdvancedNagatoSakuraTrainer:
         early_stopping_warmup_epochs: int = 8,
         resume_from_checkpoint: bool = True,
         resume_checkpoint: Optional[str] = None,
+        resume_model_only: bool = False,
         resume_lr_scale: float = 1.0,
         eval_interval_epochs: int = 5,
         metrics_log_interval_steps: int = 100,
@@ -1998,11 +2272,31 @@ class AdvancedNagatoSakuraTrainer:
                 broadcast_objects: List[Optional[str]] = [latest_checkpoint]
                 dist.broadcast_object_list(broadcast_objects, src=0)
                 latest_checkpoint = broadcast_objects[0]
-            if latest_checkpoint and self.load_checkpoint(latest_checkpoint, optimizer, scheduler, scaler):
+            if latest_checkpoint and self.load_checkpoint(
+                latest_checkpoint,
+                optimizer,
+                scheduler,
+                scaler,
+                restore_training_state=not bool(resume_model_only),
+            ):
                 self.logger.info(f"從檢查點恢復訓練: {latest_checkpoint}")
+                if resume_model_only:
+                    self.logger.info("resume_model_only 已啟用：本次從 Epoch 1 / Step 0 重新計算訓練動態")
 
                 effective_resume_lr_scale = resume_lr_scale
-                if auto_match_resume_lr:
+                skip_auto_match_due_mismatch = (
+                    auto_match_resume_lr
+                    and not resume_model_only
+                    and ("total_steps_mismatch" in self._last_resume_scheduler_alignment_reasons)
+                )
+                if skip_auto_match_due_mismatch:
+                    effective_resume_lr_scale = 1.0
+                    self.logger.warning(
+                        "檢測到 scheduler_total_steps mismatch，為避免 warmup 區間學習率被放大，"
+                        "本次已停用 resume_lr_scale 自動對齊。"
+                        "如需手動縮放請顯式設定 --resume_lr_scale。"
+                    )
+                elif auto_match_resume_lr and not resume_model_only:
                     resumed_lr = self._get_optimizer_lr(optimizer)
                     target_lr = float(learning_rate)
                     if (
@@ -2019,6 +2313,8 @@ class AdvancedNagatoSakuraTrainer:
                     else:
                         effective_resume_lr_scale = 1.0
                         self.logger.warning("無法取得有效的 resumed_lr，將跳過自動學習率縮放")
+                elif resume_model_only:
+                    effective_resume_lr_scale = 1.0
 
                 self._apply_resume_lr_scale(
                     optimizer,
@@ -2044,6 +2340,9 @@ class AdvancedNagatoSakuraTrainer:
         epochs_completed = 0
         final_eval_metrics: Optional[Dict[str, Any]] = None
         eval_history: List[Dict[str, Any]] = []
+        run_best_train_loss = float("inf")
+        run_best_eval_loss = float("inf")
+        run_best_improve_delta = max(0.0, float(save_on_improve_delta))
         run_aggregates = {
             "tokens_seen": 0,
             "invalid_loss_count": 0,
@@ -2107,6 +2406,20 @@ class AdvancedNagatoSakuraTrainer:
                 if should_log_details:
                     self.logger.info(f"Epoch {epoch + 1} 完成 - 平均損失: {epoch_loss:.4f}")
 
+                train_improved_this_run = False
+                if math.isfinite(epoch_loss):
+                    if not math.isfinite(run_best_train_loss):
+                        train_improved_this_run = True
+                    else:
+                        train_improved_this_run = (run_best_train_loss - epoch_loss) >= run_best_improve_delta
+
+                    if train_improved_this_run:
+                        run_best_train_loss = float(epoch_loss)
+                        if should_log_details:
+                            self.logger.info(
+                                f"📉 本次訓練新低 train_loss: {run_best_train_loss:.4f}"
+                            )
+
                 had_anomaly = (epoch_stats["invalid_loss_count"] > 0) or (epoch_stats["invalid_grad_count"] > 0)
 
                 run_eval = _has_eval_dataloader(eval_dataloader) and (
@@ -2119,6 +2432,7 @@ class AdvancedNagatoSakuraTrainer:
                 eval_loss = None
                 perplexity = None
                 is_best = False
+                eval_improved_this_run = False
                 previous_best = self.best_eval_loss
 
                 if run_eval:
@@ -2147,6 +2461,21 @@ class AdvancedNagatoSakuraTrainer:
                         self.best_eval_loss = eval_loss
                         if should_log_details:
                             self.logger.info(f"🎉 新的最佳模型! 評估損失: {eval_loss:.4f}")
+
+                    if math.isfinite(float(eval_loss)):
+                        eval_value = float(eval_loss)
+                        if not math.isfinite(run_best_eval_loss):
+                            eval_improved_this_run = True
+                        else:
+                            eval_improved_this_run = (run_best_eval_loss - eval_value) >= run_best_improve_delta
+
+                        if eval_improved_this_run:
+                            run_best_eval_loss = eval_value
+                            if should_log_details and not improved:
+                                self.logger.info(
+                                    f"📊 本次訓練新低 eval_loss: {run_best_eval_loss:.4f} "
+                                    f"(歷史最佳仍為 {previous_best:.4f})"
+                                )
 
                     if should_log_details:
                         self.logger.info(f"評估結果 - Loss: {eval_loss:.4f}, Perplexity: {perplexity:.2f}")
@@ -2220,6 +2549,10 @@ class AdvancedNagatoSakuraTrainer:
                     save_reasons.append("best")
                 if early_stopped and "early_stop" not in save_reasons:
                     save_reasons.append("early_stop")
+                if train_improved_this_run and "train_best" not in save_reasons:
+                    save_reasons.append("train_best")
+                if eval_improved_this_run and "eval_best_run" not in save_reasons:
+                    save_reasons.append("eval_best_run")
 
                 if save_reasons:
                     checkpoint_name = f"checkpoint-epoch-{epoch + 1}"

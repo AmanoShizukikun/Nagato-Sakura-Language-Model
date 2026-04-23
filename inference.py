@@ -6,6 +6,7 @@ import logging
 import argparse
 import warnings
 import random
+import subprocess
 import torch
 from pathlib import Path
 from typing import Optional
@@ -31,11 +32,12 @@ class InferenceConfig:
     model_path: str
     tokenizer_path: str
     device: str = "auto"
-    max_length: int = 512
+    max_length: Optional[int] = None  # None=自動使用模型 max_position_embeddings
+    max_new_tokens: int = 512
     temperature: float = 0.7
     top_k: int = 50
     top_p: float = 0.9
-    repetition_penalty: float = 1.1
+    repetition_penalty: float = 1.0
     do_sample: bool = True
     base_seed: int = -1
     silent_mode: bool = True  # 靜默模式，不顯示內存監控信息
@@ -113,6 +115,46 @@ class NagatoSakuraInference:
         self.tokenizer_manager: Optional[TokenizerManager] = None
         self.tokenizer: Optional[PreTrainedTokenizerFast] = None
         self._load_model_and_tokenizer()
+
+    def _log_tokenizer_health(self):
+        if self.tokenizer is None:
+            return
+
+        model_unk_token = None
+        model_byte_fallback = None
+        if self.tokenizer_manager is not None and self.tokenizer_manager.tokenizer_object is not None:
+            try:
+                payload = json.loads(self.tokenizer_manager.tokenizer_object.to_str())
+                model = payload.get("model", {}) if isinstance(payload, dict) else {}
+                if isinstance(model, dict):
+                    model_unk_token = model.get("unk_token")
+                    model_byte_fallback = model.get("byte_fallback")
+            except Exception:
+                pass
+
+        issues = []
+        if model_unk_token != "<unk>":
+            issues.append(f"model.unk_token={model_unk_token!r}")
+        if model_byte_fallback is not True:
+            issues.append(f"model.byte_fallback={model_byte_fallback!r}")
+
+        try:
+            probe_text = "混合 Mixed 中文English日本語😀"
+            probe_ids = self.tokenizer.encode(probe_text, add_special_tokens=False)
+            probe_decoded = self.tokenizer.decode(probe_ids, skip_special_tokens=True)
+            if "�" in probe_decoded:
+                issues.append("UTF-8 probe decode produced replacement char")
+        except Exception as e:
+            issues.append(f"UTF-8 probe failed: {e}")
+
+        if issues:
+            self.logger.warning(
+                "檢測到 legacy tokenizer 風險，可能在新字元/emoji 場景出現亂碼。"
+                "建議以 --force_retrain_tokenizer --no_resume 開新 run 重建 tokenizer。"
+                f" 詳細: {'; '.join(issues)}"
+            )
+        else:
+            self.logger.info("Tokenizer UTF-8 健檢通過。")
     
     def _load_model_and_tokenizer(self):
         """加載模型和分詞器"""
@@ -122,8 +164,9 @@ class NagatoSakuraInference:
             self.tokenizer_manager.load_tokenizer()
             self.tokenizer = self.tokenizer_manager.transformers_tokenizer
             self.logger.info(
-                f"分詞器就緒: {self.config.tokenizer_path} (詞彙量 {self.tokenizer.vocab_size})"
+                f"分詞器就緒: {self.config.tokenizer_path} (詞彙量 {len(self.tokenizer)})"
             )
+            self._log_tokenizer_health()
             
             # 加載模型配置
             config_path = Path(self.config.model_path) / "config.json"
@@ -134,13 +177,14 @@ class NagatoSakuraInference:
             else:
                 # 使用默認配置
                 self.logger.warning("未找到配置文件，使用默認配置")
-                model_config = NSConfig(vocab_size=self.tokenizer.vocab_size)
+                model_config = NSConfig(vocab_size=len(self.tokenizer))
             
             # 確保配置與分詞器一致
-            model_config.vocab_size = self.tokenizer.vocab_size
+            model_config.vocab_size = len(self.tokenizer)
             model_config.pad_token_id = self.tokenizer.pad_token_id
             model_config.bos_token_id = self.tokenizer.bos_token_id
             model_config.eos_token_id = self.tokenizer.eos_token_id
+            model_config.unk_token_id = self.tokenizer.unk_token_id
 
             # 套用命令列覆寫（0.5.0）
             if self.config.num_key_value_heads is not None:
@@ -153,6 +197,14 @@ class NagatoSakuraInference:
                 model_config.kv_quant_group_size = self.config.kv_quant_group_size
             if self.config.kv_residual_sign_correction is not None:
                 model_config.kv_residual_sign_correction = self.config.kv_residual_sign_correction
+
+            # 推理上下文上限：預設追隨模型配置，可由 --max_length 覆寫（但不超模型上限）
+            model_max_length = int(getattr(model_config, "max_position_embeddings", 512))
+            if self.config.max_length is None or int(self.config.max_length) <= 0:
+                self.config.max_length = model_max_length
+            else:
+                self.config.max_length = min(int(self.config.max_length), model_max_length)
+            self.logger.info(f"推理上下文上限: {self.config.max_length} (模型上限: {model_max_length})")
             
             # 創建模型
             self.logger.info(f"加載模型: {self.config.model_path}")
@@ -235,7 +287,7 @@ class NagatoSakuraInference:
         
         return input_ids.to(self.device)
 
-    def stream_generate(self, prompt: str, max_new_tokens: int = 2048, **kwargs):
+    def stream_generate(self, prompt: str, max_new_tokens: int = 512, **kwargs):
         """
         流式生成響應 - 內存優化版本
         
@@ -251,11 +303,16 @@ class NagatoSakuraInference:
             raise RuntimeError("模型或分詞器未初始化")
         
         try:
+            max_context_len = int(
+                self.config.max_length
+                or getattr(self.model.config, "max_position_embeddings", 512)
+            )
+
             # 準備輸入
             input_ids = self._prepare_input(prompt)
             
             # 檢查輸入長度
-            if input_ids.shape[1] >= self.config.max_length - 100:
+            if input_ids.shape[1] >= max_context_len - 10:
                 yield {"delta": "輸入太長，請縮短後重試。", "finished": True, "error": True}
                 return
             
@@ -263,11 +320,12 @@ class NagatoSakuraInference:
             current_seed = self.seed_manager.get_new_seed()
             
             # 設置生成參數 - 限制最大長度防止內存爆炸
-            effective_max_tokens = min(
-                max_new_tokens, 
-                self.config.max_length - input_ids.shape[1] - 50,
-                1024  # 硬限制最大生成長度
-            )
+            available_tokens = max_context_len - input_ids.shape[1] - 10
+            if available_tokens <= 0:
+                yield {"delta": "可用上下文長度不足，請縮短輸入或提高 max_length。", "finished": True, "error": True}
+                return
+
+            effective_max_tokens = min(max(1, int(max_new_tokens)), max(1, int(available_tokens)))
             
             generation_params = {
                 'max_new_tokens': effective_max_tokens,
@@ -414,7 +472,7 @@ class NagatoSakuraInference:
                 full_response = ""
                 
                 try:
-                    max_new_tokens = min(1024, max(64, self.config.max_length // 2))
+                    max_new_tokens = max(1, int(self.config.max_new_tokens))
 
                     for output in self.stream_generate(
                         user_input,
@@ -471,13 +529,14 @@ class NagatoSakuraInference:
 /cleanup - 手動清理GPU內存
 /verbose - 切換詳細模式（顯示內存監控）
 /set <param> <value> - 設置生成參數
-  可設置參數: temperature, top_k, top_p, max_length
+    可設置參數: temperature, top_k, top_p, repetition_penalty, max_length, max_new_tokens
 /seed <seed> - 設置基礎種子（-1為隨機）
 """)
         elif cmd == "config":
             print(f"""
 🔧 當前配置:
 - 最大長度: {self.config.max_length}
+- 單輪最大生成token: {self.config.max_new_tokens}
 - 溫度: {self.config.temperature}
 - Top-k: {self.config.top_k}
 - Top-p: {self.config.top_p}
@@ -563,7 +622,12 @@ class NagatoSakuraInference:
                 elif param == "repetition_penalty":
                     self.config.repetition_penalty = max(1.0, min(2.0, value))
                 elif param == "max_length":
-                    self.config.max_length = max(50, min(2048, int(value)))
+                    model_max = int(getattr(self.model.config, "max_position_embeddings", 8192)) if self.model else 8192
+                    self.config.max_length = max(50, min(model_max, int(value)))
+                    self.config.max_new_tokens = min(int(self.config.max_new_tokens), max(1, self.config.max_length - 10))
+                elif param == "max_new_tokens":
+                    max_limit = max(1, int(self.config.max_length or 512) - 10)
+                    self.config.max_new_tokens = max(1, min(max_limit, int(value)))
                 else:
                     print(f"❌ 未知參數: {param}")
                     return
@@ -632,7 +696,7 @@ class NagatoSakuraInference:
         except Exception as e:
             self.logger.error(f"保存對話歷史失敗: {e}")
 
-    def single_inference(self, prompt: str, max_new_tokens: int = 2048, **kwargs) -> str:
+    def single_inference(self, prompt: str, max_new_tokens: int = 512, **kwargs) -> str:
         """
         單次推理（非交互式）
         
@@ -657,28 +721,103 @@ class NagatoSakuraInference:
         
         return full_response
 
+
+def _append_common_web_args(command: list, args: argparse.Namespace):
+    """附加通用 Web 參數到子程序命令列。"""
+    def append_arg(name: str, value):
+        if value is not None:
+            command.extend([name, str(value)])
+
+    append_arg("--model_path", args.model_path)
+    append_arg("--tokenizer_path", args.tokenizer_path)
+    append_arg("--device", args.device)
+    append_arg("--max_length", args.max_length)
+    append_arg("--max_new_tokens", args.max_new_tokens)
+    append_arg("--temperature", args.temperature)
+    append_arg("--top_k", args.top_k)
+    append_arg("--top_p", args.top_p)
+    append_arg("--repetition_penalty", args.repetition_penalty)
+    append_arg("--seed", args.seed)
+    append_arg("--history_rounds", args.history_rounds)
+    append_arg("--kv_cache_bits", args.kv_cache_bits)
+    append_arg("--kv_quant_group_size", args.kv_quant_group_size)
+    append_arg("--num_key_value_heads", args.num_key_value_heads)
+
+    if args.no_sample:
+        command.append("--no_sample")
+    if args.verbose:
+        command.append("--verbose")
+    if args.stateless_chat:
+        command.append("--stateless_chat")
+    if args.quantize_kv_cache:
+        command.append("--quantize_kv_cache")
+    if args.kv_residual_sign_correction:
+        command.append("--kv_residual_sign_correction")
+
+
+def launch_flask_web_demo(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """啟動 Flask Web Demo（tools/web_demo_flask.py）。"""
+    web_demo_path = Path(__file__).resolve().parent / "tools" / "web_demo_flask.py"
+    if not web_demo_path.exists():
+        logger.error(f"找不到 Flask Web Demo 腳本: {web_demo_path}")
+        return 1
+
+    try:
+        import flask  # noqa: F401
+    except ImportError:
+        logger.error("未安裝 flask。請先執行: pip install flask")
+        return 1
+
+    command = [
+        sys.executable,
+        str(web_demo_path),
+        "--web_host",
+        str(args.web_host),
+        "--web_port",
+        str(args.web_port),
+    ]
+    _append_common_web_args(command, args)
+
+    logger.info(
+        f"啟動 Flask Web Demo: http://{args.web_host}:{args.web_port} "
+        f"(腳本: {web_demo_path})"
+    )
+
+    try:
+        result = subprocess.run(command, check=False)
+        return int(result.returncode)
+    except Exception as e:
+        logger.error(f"啟動 Flask Web Demo 失敗: {e}")
+        return 1
+
+
+def launch_web_demo(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """啟動 Flask Web UI。"""
+    return launch_flask_web_demo(args, logger)
+
 def main():
     """主函數"""
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-0.2/checkpoint-epoch-46", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-1.3/checkpoint-epoch-12", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式
-    parser.add_argument("--mode", type=str, default="interactive", 
-                       choices=["interactive", "single"],
-                       help="推理模式: interactive=交互式對話, single=單次推理")
+    parser.add_argument("--mode", type=str, default="web", 
+                       choices=["interactive", "single", "web"],
+                       help="推理模式: interactive=交互式對話, single=單次推理, web=啟動Web介面")
     
     # 單次推理參數
     parser.add_argument("--prompt", type=str, help="單次推理的輸入提示")
-    parser.add_argument("--max_new_tokens", type=int, default=2048, help="最大新生成token數")
+    parser.add_argument("--max_new_tokens", type=int, default=512, help="最大新生成token數")
+    parser.add_argument("--max_length", type=int, default=0, help="推理上下文上限（0=自動使用模型 max_position_embeddings）")
     
     # 生成參數
     parser.add_argument("--temperature", type=float, default=0.7, help="溫度參數")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k參數")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p參數")
-    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="重複懲罰")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0, help="重複懲罰")
     parser.add_argument("--no_sample", action="store_true", help="禁用採樣（使用貪婪解碼）")
 
     # 0.5.0 量化/架構覆寫
@@ -690,6 +829,7 @@ def main():
     
     # 種子控制
     parser.add_argument("--seed", type=int, default=-1, help="基礎種子（-1為隨機種子）")
+    parser.add_argument("--history_rounds", type=int, default=3, help="Web 對話保留歷史輪次")
     
     # 調試選項
     parser.add_argument("--verbose", action="store_true", help="啟用詳細輸出（包括內存監控）")
@@ -698,6 +838,8 @@ def main():
     # 其他
     parser.add_argument("--device", type=str, default="auto", help="指定設備")
     parser.add_argument("--log_level", type=str, default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="日誌級別")
+    parser.add_argument("--web_host", type=str, default="127.0.0.1", help="Web UI 監聽位址（mode=web）")
+    parser.add_argument("--web_port", type=int, default=8501, help="Web UI 埠號（mode=web）")
     
     args = parser.parse_args()
     
@@ -715,12 +857,20 @@ def main():
             else:
                 logger.error("未找到分詞器文件，請指定 --tokenizer_path")
                 return
+
+        if args.mode == "web":
+            exit_code = launch_web_demo(args, logger)
+            if exit_code != 0:
+                sys.exit(exit_code)
+            return
         
         # 創建推理配置
         config = InferenceConfig(
             model_path=args.model_path,
             tokenizer_path=args.tokenizer_path,
             device=args.device,
+            max_length=(None if int(args.max_length) <= 0 else int(args.max_length)),
+            max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,

@@ -492,6 +492,7 @@ class NSConfig:
     pad_token_id: Optional[int] = 0
     bos_token_id: Optional[int] = 1
     eos_token_id: Optional[int] = 2
+    unk_token_id: Optional[int] = None
     
     # 分組查詢注意力 (GQA) 支援
     num_key_value_heads: Optional[int] = None  # 如果為 None，則等於 num_attention_heads
@@ -1437,6 +1438,13 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 獲取配置中的默認值
         pad_token_id = pad_token_id or getattr(self.config, 'pad_token_id', None)
         eos_token_id = eos_token_id or getattr(self.config, 'eos_token_id', None)
+        config_unk_token_id = getattr(self.config, 'unk_token_id', None)
+        exclude_token_ids: Optional[List[int]] = None
+        if config_unk_token_id is not None:
+            try:
+                exclude_token_ids = [int(config_unk_token_id)]
+            except Exception:
+                exclude_token_ids = None
 
         batch_size, input_length = input_ids.shape
         device = input_ids.device
@@ -1486,7 +1494,8 @@ class NagatoSakuraForCausalLM(nn.Module):
                     repetition_penalty=repetition_penalty,
                     generated_tokens=generated_ids,
                     input_length=input_length,
-                    do_sample=do_sample
+                    do_sample=do_sample,
+                    exclude_token_ids=exclude_token_ids,
                 )
                 
                 next_tokens = next_tokens.unsqueeze(-1)
@@ -1549,6 +1558,13 @@ class NagatoSakuraForCausalLM(nn.Module):
         # 獲取特殊token
         pad_token_id = getattr(self.config, 'pad_token_id', None)
         eos_token_id = getattr(self.config, 'eos_token_id', None)
+        config_unk_token_id = getattr(self.config, 'unk_token_id', None)
+        exclude_token_ids: Optional[List[int]] = None
+        if config_unk_token_id is not None:
+            try:
+                exclude_token_ids = [int(config_unk_token_id)]
+            except Exception:
+                exclude_token_ids = None
         
         # 初始化注意力掩碼
         if attention_mask is None:
@@ -1587,7 +1603,8 @@ class NagatoSakuraForCausalLM(nn.Module):
                     repetition_penalty=repetition_penalty,
                     generated_tokens=generated_ids,
                     input_length=input_length,
-                    do_sample=do_sample
+                    do_sample=do_sample,
+                    exclude_token_ids=exclude_token_ids,
                 )
                 next_token = next_tokens.unsqueeze(-1)
                 

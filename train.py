@@ -29,7 +29,7 @@ def main():
 
     # 數據相關
     parser.add_argument("--training_data_file", type=str, help="訓練數據來源（檔案或資料夾）；未指定時使用 data/train")
-    parser.add_argument("--output_dir", type=str, default="NS-LLM-0.1", help="輸出目錄")
+    parser.add_argument("--output_dir", type=str, default="NS-LLM-1.3", help="輸出目錄")
     parser.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
     parser.add_argument("--eval_split_ratio", type=float, default=0.0, help="評估集分割比例（使用固定評估集時請設為0）")
     parser.add_argument("--eval_data_file", type=str, help="固定評估集來源（檔案或資料夾）；未指定時使用 data/eval")
@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--tokenizer_min_frequency", type=int, default=5, help="分詞器最小詞頻")
     parser.add_argument("--tokenizer_train_max_samples", type=int, default=0, help="分詞器最多使用多少訓練樣本（0=不限制）")
     parser.add_argument("--tokenizer_num_threads", type=int, default=0, help="分詞器執行緒數（0=自動）")
+    parser.add_argument("--tokenizer_universal_charset", action="store_true", default=True, help="啟用萬能分詞器分層保底（UTF-8 byte/中英日/注音/emoji/程式符號）")
+    parser.add_argument("--no_tokenizer_universal_charset", action="store_false", dest="tokenizer_universal_charset", help="禁用萬能分詞器保底字元")
+    parser.add_argument("--tokenizer_extra_chars_file", action="append", default=[], help="額外保底字元/詞彙檔案（例如甲乙丙字表），可重複指定")
     parser.add_argument("--hidden_size", type=int, default=512, help="隱藏層大小")
     parser.add_argument("--num_layers", type=int, default=8, help="層數")
     parser.add_argument("--num_heads", type=int, default=8, help="注意力頭數")
@@ -70,6 +73,8 @@ def main():
     parser.add_argument("--pretokenize_cache", action="store_true", default=True, help="啟用預分詞快取")
     parser.add_argument("--no_pretokenize_cache", action="store_false", dest="pretokenize_cache", help="禁用預分詞快取")
     parser.add_argument("--disable_pretokenize", action="store_true", help="停用啟動前預分詞（改為訓練時即時分詞）")
+    parser.add_argument("--unk_audit_max_samples", type=int, default=4096, help="資料集 <unk> 抽樣掃描上限（每個 split）")
+    parser.add_argument("--fail_on_unk_tokens", action="store_true", help="若資料集掃描發現 <unk> token，立即中止訓練")
 
     # 精度與多卡
     parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"], help="訓練精度模式")
@@ -102,6 +107,7 @@ def main():
     parser.add_argument("--checkpoint_cleanup", action="store_true", help="啟用舊checkpoint自動清理")
     parser.add_argument("--no_resume", action="store_true", help="不從檢查點恢復")
     parser.add_argument("--resume_checkpoint", type=str, help="指定恢復的checkpoint路徑（可為相對或絕對路徑）")
+    parser.add_argument("--resume_model_only", action="store_true", help="僅恢復模型權重，不恢復 optimizer/scheduler/scaler 與 step/epoch")
     parser.add_argument("--resume_lr_scale", type=float, default=0.0, help="續訓後套用學習率縮放（<=0 代表自動對齊到 --learning_rate；例如 0.5 代表將當前LR減半）")
 
     # 其他
@@ -114,6 +120,9 @@ def main():
 
     if args.no_resume and args.resume_checkpoint:
         print("警告: 已設定 --no_resume，將忽略 --resume_checkpoint")
+
+    if args.force_retrain_tokenizer and not args.no_resume:
+        parser.error("啟用 --force_retrain_tokenizer 時必須同時指定 --no_resume，以避免新詞表與舊 checkpoint 不相容")
 
     if _should_use_auto_ddp(args):
         world_size = torch.cuda.device_count()
@@ -193,6 +202,8 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
                     eval_data_file=eval_data_source,
                     tokenizer_train_max_samples=args.tokenizer_train_max_samples,
                     tokenizer_num_threads=args.tokenizer_num_threads,
+                    tokenizer_enable_universal_charset=args.tokenizer_universal_charset,
+                    tokenizer_extra_chars_files=args.tokenizer_extra_chars_file,
                 )
                 dist.barrier()
             else:
@@ -211,10 +222,12 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
                 eval_data_file=eval_data_source,
                 tokenizer_train_max_samples=args.tokenizer_train_max_samples,
                 tokenizer_num_threads=args.tokenizer_num_threads,
+                tokenizer_enable_universal_charset=args.tokenizer_universal_charset,
+                tokenizer_extra_chars_files=args.tokenizer_extra_chars_file,
             )
 
         model_config = NSConfig(
-            vocab_size=trainer.tokenizer_manager.transformers_tokenizer.vocab_size,
+            vocab_size=len(trainer.tokenizer_manager.transformers_tokenizer),
             hidden_size=args.hidden_size,
             intermediate_size=args.intermediate_size,
             num_hidden_layers=args.num_layers,
@@ -225,6 +238,7 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             pad_token_id=trainer.tokenizer_manager.transformers_tokenizer.pad_token_id,
             bos_token_id=trainer.tokenizer_manager.transformers_tokenizer.bos_token_id,
             eos_token_id=trainer.tokenizer_manager.transformers_tokenizer.eos_token_id,
+            unk_token_id=trainer.tokenizer_manager.transformers_tokenizer.unk_token_id,
             tie_word_embeddings=True,
             rope_theta=10000.0,
             rms_norm_eps=1e-6,
@@ -248,6 +262,8 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             pretokenize_batch_size=args.pretokenize_batch_size,
             pretokenize_num_proc=args.pretokenize_num_proc,
             use_pretokenize_cache=args.pretokenize_cache,
+            fail_on_unk_tokens=args.fail_on_unk_tokens,
+            unk_audit_max_samples=args.unk_audit_max_samples,
         )
 
         trainer.train(
@@ -269,6 +285,7 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             early_stopping_warmup_epochs=args.early_stopping_warmup_epochs,
             resume_from_checkpoint=not args.no_resume,
             resume_checkpoint=args.resume_checkpoint,
+            resume_model_only=args.resume_model_only,
             resume_lr_scale=args.resume_lr_scale,
             eval_interval_epochs=args.eval_interval_epochs,
             eval_short_max_tokens=args.eval_short_max_tokens,

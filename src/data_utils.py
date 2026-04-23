@@ -271,11 +271,36 @@ def _build_pretokenize_cache_fingerprint(
     data_list: List[Dict[str, Any]],
     max_seq_length: int,
     cache_namespace: str = "",
+    tokenizer: Optional[PreTrainedTokenizerFast] = None,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(str(max_seq_length).encode("utf-8"))
     digest.update(cache_namespace.encode("utf-8"))
     digest.update(str(len(data_list)).encode("utf-8"))
+
+    if tokenizer is not None:
+        tokenizer_signature: Dict[str, Any] = {
+            "len": int(len(tokenizer)),
+            "vocab_size": int(getattr(tokenizer, "vocab_size", 0)),
+            "unk_token": tokenizer.unk_token,
+            "pad_token": tokenizer.pad_token,
+            "bos_token": tokenizer.bos_token,
+            "eos_token": tokenizer.eos_token,
+            "unk_token_id": tokenizer.unk_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        try:
+            backend_payload = json.loads(tokenizer.backend_tokenizer.to_str())
+            model_payload = backend_payload.get("model", {}) if isinstance(backend_payload, dict) else {}
+            if isinstance(model_payload, dict):
+                tokenizer_signature["model_type"] = model_payload.get("type")
+                tokenizer_signature["model_unk_token"] = model_payload.get("unk_token")
+                tokenizer_signature["byte_fallback"] = model_payload.get("byte_fallback")
+        except Exception:
+            pass
+        digest.update(json.dumps(tokenizer_signature, ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
     if not data_list:
         return digest.hexdigest()[:16]
@@ -340,6 +365,7 @@ def pretokenize_supervised_dataset(
             data_list=data_list,
             max_seq_length=max_seq_length,
             cache_namespace=cache_namespace,
+            tokenizer=tokenizer,
         )
         cache_path = cache_root / f"{desc.lower().replace(' ', '_')}_{cache_fingerprint}"
 

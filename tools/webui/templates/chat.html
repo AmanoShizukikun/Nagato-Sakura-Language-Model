@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>長門櫻 Flask Web UI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='flask-chat.css', v='20260421b33') }}">
+</head>
+<body>
+    <div class="cyber-bg" aria-hidden="true"></div>
+    <div class="grid-overlay" aria-hidden="true"></div>
+    <div class="grain-overlay" aria-hidden="true"></div>
+    <div class="settings-backdrop" id="settingsBackdrop" aria-hidden="true"></div>
+
+    <div class="app-shell">
+        <aside class="left-sidebar" id="leftSidebar" aria-label="對話側欄">
+            <div class="sidebar-head">
+                <div>
+                    <h2>Dialog Matrix</h2>
+                    <p>對話管理與快速切換</p>
+                </div>
+                <button type="button" id="closeSidebarBtn" class="icon-btn" aria-label="摺疊側欄" title="摺疊側欄">◀</button>
+            </div>
+
+            <div class="sidebar-actions">
+                <button type="button" id="newChatBtn" class="btn solid" title="新對話">
+                    <span class="btn-icon" aria-hidden="true">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+                    </span>
+                    <span class="btn-label">新對話</span>
+                </button>
+                <button type="button" id="tempChatBtn" class="btn ghost" title="臨時對話">
+                    <span class="btn-icon" aria-hidden="true">
+                        <!-- Terminal icon indicating volatile/command context -->
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                    </span>
+                    <span class="btn-label">臨時對話</span>
+                </button>
+            </div>
+
+            <div class="search-wrap">
+                <input id="searchConversationInput" type="search" placeholder="搜尋對話標題或內容...">
+            </div>
+
+            <section class="history-wrap">
+                <div class="history-title-row">
+                    <h3>過去聊天紀錄</h3>
+                    <span id="conversationCount" class="history-count">0</span>
+                </div>
+                <div id="conversationList" class="conversation-list"></div>
+            </section>
+
+            <div class="sidebar-footer">
+                <button type="button" id="openSettingsBtn" class="btn ghost" title="設定">
+                    <span class="btn-icon" aria-hidden="true">
+                        <!-- CPU/Matrix icon matching "Control Matrix" -->
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
+                    </span>
+                    <span class="btn-label">設定</span>
+                </button>
+            </div>
+        </aside>
+
+        <main class="chat-stage">
+            <header class="topbar">
+                <div class="topbar-left">
+                    <div class="brand">
+                        <div class="brand-logo">
+                            <img src="{{ url_for('static', filename='NS-V2.png') }}" alt="logo" width="100%">
+                            <span id="brandStatusDot" class="brand-status offline" aria-label="狀態: 離線" title="離線"></span>
+                        </div>
+                        <div>
+                            <h1>長門櫻</h1>
+                            <p id="activeConversationLabel">Flask 主介面 · Streamlit 後備</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="topbar-right">
+                    <button type="button" id="voiceCallBtn" class="discord-icon-btn" aria-label="語音通話" title="語音通話">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+                    </button>
+                    <button type="button" id="videoCallBtn" class="discord-icon-btn" aria-label="視訊通話" title="視訊通話">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2" ry="2"/></svg>
+                    </button>
+                    <button type="button" id="roleInfoBtn" class="discord-icon-btn" aria-label="角色資料" title="角色資料">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                    </button>
+                </div>
+            </header>
+
+            <section id="chatList" class="chat-list" aria-live="polite"></section>
+
+            <div id="chatJumpWrap" class="chat-jump-wrap" aria-hidden="true">
+                <button type="button" id="jumpToLatestBtn" class="chat-jump-btn" aria-label="跳轉至當前對話底部" title="跳轉至當前對話">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v12"/><path d="m5 12 7 7 7-7"/><path d="M5 21h14"/></svg>
+                    <span>跳轉至當前對話</span>
+                </button>
+            </div>
+
+            <footer class="composer-wrap">
+                <div class="composer-shell" style="position: relative;">
+                    <button type="button" id="attachBtn" class="composer-btn" aria-label="附加檔案" title="附加檔案">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
+                    </button>
+                    <textarea id="promptInput" rows="1" placeholder="輸入想對長門櫻說的話，按 Enter 送出，Shift+Enter 換行"></textarea>
+                    <canvas id="voiceVisualizer" style="display: none; position: absolute; left: 52px; right: 52px; top: 50%; transform: translateY(-50%); height: 40px; width: calc(100% - 104px); pointer-events: none; z-index: 10;"></canvas>
+                    <button type="button" id="micBtn" class="composer-btn" aria-label="語音輸入" title="語音輸入">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+                    </button>
+                </div>
+            </footer>
+        </main>
+
+        <aside class="right-sidebar" id="rightSidebar" aria-label="角色資料">
+            <div class="role-info-card" style="position: relative;">
+                <button type="button" id="closeRightSidebarBtn" class="icon-btn" aria-label="關閉" title="關閉" style="position: absolute; top: 8px; right: 8px;">×</button>
+                <div class="role-info-header">
+                    <img src="{{ url_for('static', filename='NS-V2.png') }}" alt="avatar" class="role-info-avatar">
+                    <div class="role-info-title">
+                        <strong>長門櫻</strong>
+                        <span>Nagato Sakura</span>
+                    </div>
+                </div>
+
+                <div class="role-info-section">
+                    <h4>關於</h4>
+                    <p>主人您好！我叫長門櫻，是由天野靜樹於西元2023年9月19日所創造的金髮獸娘。長門櫻能夠回答您的問題，提供有趣的小知識，或者和您隨便聊聊天，順便調節一下您的心情，不過別忘了，雖然我是個女僕，但是我可不會煮咖啡或者做飯哦！ 🌸</p>
+                </div>
+            </div>
+
+            <div class="settings-block">
+                <div class="range-row">
+                    <label for="temperature">temperature</label>
+                    <span id="temperatureLabel"></span>
+                </div>
+                <input id="temperature" type="range" min="0.1" max="1.8" step="0.05">
+            </div>
+
+            <div class="settings-block">
+                <div class="range-row">
+                    <label for="topP">top_p</label>
+                    <span id="topPLabel"></span>
+                </div>
+                <input id="topP" type="range" min="0.1" max="1.0" step="0.01">
+            </div>
+
+            <div class="settings-block">
+                <div class="range-row">
+                    <label for="repetitionPenalty">repetition_penalty</label>
+                    <span id="repetitionPenaltyLabel"></span>
+                </div>
+                <input id="repetitionPenalty" type="range" min="1.0" max="2.0" step="0.01">
+            </div>
+
+            <div class="settings-grid">
+                <div class="settings-item">
+                    <label for="historyRounds">歷史輪次</label>
+                    <input id="historyRounds" type="number" min="0" max="40" step="1">
+                </div>
+                <div class="settings-item">
+                    <label for="maxLength">上下文長度</label>
+                    <input id="maxLength" type="number" min="128" step="128">
+                </div>
+                <div class="settings-item">
+                    <label for="maxNewTokens">單輪生成 token</label>
+                    <input id="maxNewTokens" type="number" min="16" step="16">
+                </div>
+                <div class="settings-item">
+                    <label for="topK">top_k</label>
+                    <input id="topK" type="number" min="1" max="200" step="1">
+                </div>
+            </div>
+
+            <div style="margin-top: auto; padding-top: 16px; display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; gap: 8px;">
+                    <button type="button" id="saveModelSettingsBtn" class="btn solid" style="flex: 1;">儲存</button>
+                    <button type="button" id="resetModelSettingsBtn" class="btn ghost" style="flex: 1;">重設</button>
+                </div>
+                <button type="button" id="viewFullProfileBtn" class="btn ghost" style="width: 100%;">檢視完整資料</button>
+            </div>
+        </aside>
+    </div>
+
+    <div class="settings-modal" id="settingsModal" aria-hidden="true">
+        <section class="settings-panel settings-center" aria-label="系統設定">
+            <div class="panel-head">
+                <div>
+                    <h2>System Nexus</h2>
+                    <p>完整設定中心</p>
+                </div>
+                <button type="button" id="closeSettingsBtn" class="icon-btn" aria-label="關閉設定">×</button>
+            </div>
+
+            <div class="settings-center-body">
+                <nav class="settings-nav" id="settingsNav" aria-label="設定分類">
+                    <button type="button" class="settings-nav-item" data-settings-section="profile">個人資料</button>
+                    <button type="button" class="settings-nav-item active" data-settings-section="audioVideo" aria-current="page">語音 & 視訊</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="theme">主題</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="display">顯示</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="shortcuts">快捷</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="languageTime">語言 & 時間</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="toolRegistry">註冊工具</button>
+                </nav>
+
+                <div class="settings-content">
+                    <section class="settings-tab-panel" id="settingsSectionProfile" data-settings-panel="profile" aria-label="個人資料設定">
+                        <div class="settings-block">
+                            <h3>用戶資訊</h3>
+                            <div class="settings-grid settings-grid-single-mobile">
+                                <div class="settings-item">
+                                    <label for="profileUserName">用戶名稱</label>
+                                    <input id="profileUserName" type="text" maxlength="24" placeholder="主人">
+                                    <small class="field-hint">聊天訊息中的使用者名稱顯示（預設：主人）。</small>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="settings-block">
+                            <h3>用戶頭像</h3>
+                            <div class="profile-avatar-editor">
+                                <div class="profile-avatar-preview" id="profileAvatarPreview" aria-label="頭像預覽">主</div>
+                                <div class="profile-avatar-actions">
+                                    <button type="button" class="btn ghost" id="profileAvatarUploadBtn">選擇圖片</button>
+                                    <button type="button" class="btn ghost" id="profileAvatarClearBtn">清除頭像</button>
+                                    <input id="profileAvatarFile" type="file" accept="image/*" hidden>
+                                </div>
+                            </div>
+                            <small class="field-hint">建議使用 1:1 圖片（上限 2MB），設定儲存在本機瀏覽器。</small>
+                        </div>
+                    </section>
+
+                    <section class="settings-tab-panel active" id="settingsSectionAudioVideo" data-settings-panel="audioVideo" aria-label="語音與視訊設定">
+                        <div class="settings-block">
+                            <div class="settings-section-head">
+                                <h3>裝置管理</h3>
+                                <button type="button" class="btn ghost" id="refreshDevicesBtn">重新掃描裝置</button>
+                            </div>
+                            <div class="settings-grid settings-grid-single-mobile">
+                                <div class="settings-item">
+                                    <label for="avMicDevice">麥克風</label>
+                                    <select id="avMicDevice"></select>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="avSpeakerDevice">喇叭</label>
+                                    <select id="avSpeakerDevice"></select>
+                                    <small class="field-hint" id="speakerSupportHint">此瀏覽器可能不支援輸出裝置切換，將使用系統預設喇叭。</small>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="avCameraDevice">攝影機</label>
+                                    <select id="avCameraDevice"></select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="settings-block">
+                            <h3>音訊強化</h3>
+                            <div class="toggle-grid settings-toggle-stack">
+                                <label class="toggle-item"><input id="avEchoCancellation" type="checkbox"><span>回音消除 (Echo Cancellation)</span></label>
+                                <label class="toggle-item"><input id="avNoiseSuppression" type="checkbox"><span>噪音抑制 (Noise Suppression)</span></label>
+                                <label class="toggle-item"><input id="avAutoGainControl" type="checkbox"><span>自動增益 (Auto Gain Control)</span></label>
+                            </div>
+
+                            <div class="range-row range-row-spaced">
+                                <label for="avMicGain">麥克風增益</label>
+                                <span id="avMicGainLabel">1.00</span>
+                            </div>
+                            <input id="avMicGain" type="range" min="0.5" max="2.0" step="0.05" value="1.0">
+                        </div>
+
+                        <div class="settings-block">
+                            <h3>麥克風測試</h3>
+                            <div class="action-row">
+                                <button type="button" class="btn solid" id="startMicMonitorBtn">開始音量監測</button>
+                                <button type="button" class="btn ghost" id="stopMicMonitorBtn">停止音量監測</button>
+                                <button type="button" class="btn ghost" id="recordMicTestBtn">錄製 5 秒測試</button>
+                            </div>
+                            <div class="meter-wrap" aria-label="麥克風音量">
+                                <div class="meter-bar" id="micLevelBar"></div>
+                            </div>
+                            <audio id="micTestPlayback" controls preload="none"></audio>
+                        </div>
+
+                        <div class="settings-block">
+                            <h3>攝影機測試</h3>
+                            <div class="action-row">
+                                <button type="button" class="btn solid" id="startCameraTestBtn">開啟預覽</button>
+                                <button type="button" class="btn ghost" id="stopCameraTestBtn">停止預覽</button>
+                            </div>
+                            <div class="camera-preview-shell">
+                                <video id="cameraPreview" autoplay muted playsinline></video>
+                            </div>
+                        </div>
+
+                        <div class="settings-status" id="avStatusText">等待裝置就緒</div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionTheme" data-settings-panel="theme" aria-label="主題設定">
+                        <div class="settings-block">
+                            <h3>主題風格</h3>
+                            <div class="settings-item">
+                                <label for="themePreset">預設主題</label>
+                                <select id="themePreset">
+                                    <option value="cyber">Cyber Neon</option>
+                                    <option value="sunset">Solar Sunset</option>
+                                </select>
+                            </div>
+                            <p class="field-hint">變更後立即套用，儲存後會在下次開啟時保持。</p>
+                        </div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionDisplay" data-settings-panel="display" aria-label="顯示設定">
+                        <div class="settings-block">
+                            <h3>閱讀與動畫</h3>
+                            <div class="range-row range-row-spaced">
+                                <label for="displayFontScale">字體縮放</label>
+                                <span id="displayFontScaleLabel">1.00x</span>
+                            </div>
+                            <input id="displayFontScale" type="range" min="0.9" max="1.3" step="0.05" value="1.0">
+                        </div>
+
+                        <div class="settings-grid settings-grid-single-mobile">
+                            <div class="settings-item">
+                                <label for="displayChatUiMode">聊天 UI 風格</label>
+                                <select id="displayChatUiMode">
+                                    <option value="bubbleOnly">僅對話框</option>
+                                    <option value="avatarBubble">頭像 + 對話框</option>
+                                    <option value="discord">頭像 + 名稱 + 時間 + 對話框</option>
+                                </select>
+                                <small class="field-hint">切換後會立即更新當前聊天室訊息版型。</small>
+                            </div>
+                            <div class="settings-item">
+                                <label for="displayDensity">資訊密度</label>
+                                <select id="displayDensity">
+                                    <option value="compact">緊湊</option>
+                                    <option value="normal">標準</option>
+                                    <option value="relaxed">寬鬆</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="toggle-grid settings-toggle-stack">
+                            <label class="toggle-item"><input id="displayAnimations" type="checkbox" checked><span>啟用介面動畫</span></label>
+                        </div>
+
+                        <div class="settings-block">
+                            <h3>訊息 Meta 顯示欄位</h3>
+                            <div class="toggle-grid settings-toggle-stack">
+                                <label class="toggle-item"><input id="displayMetaTokensPerSec" type="checkbox" checked><span>生成速度 token/s</span></label>
+                                <label class="toggle-item"><input id="displayMetaTokens" type="checkbox" checked><span>生成 tokens 數</span></label>
+                                <label class="toggle-item"><input id="displayMetaElapsed" type="checkbox" checked><span>生成時間</span></label>
+                                <label class="toggle-item"><input id="displayMetaStopReason" type="checkbox" checked><span>停止原因</span></label>
+                            </div>
+                            <p class="field-hint">控制 message-actions 內的 message-meta-info 顯示內容，切換後會即時更新聊天室。</p>
+                        </div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionShortcuts" data-settings-panel="shortcuts" aria-label="快捷設定">
+                        <div class="settings-block">
+                            <h3>輸入與快捷</h3>
+                            <div class="toggle-grid settings-toggle-stack">
+                                <label class="toggle-item"><input id="shortcutEnterToSend" type="checkbox" checked><span>Enter 送出訊息</span></label>
+                                <label class="toggle-item"><input id="shortcutEscClosePanels" type="checkbox" checked><span>ESC 關閉設定與側欄</span></label>
+                                <label class="toggle-item"><input id="shortcutSlashFocusInput" type="checkbox" checked><span>/ 快速聚焦輸入框</span></label>
+                                <label class="toggle-item"><input id="doSample" type="checkbox" checked><span>啟用採樣生成</span></label>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionLanguageTime" data-settings-panel="languageTime" aria-label="語言與時間設定">
+                        <div class="settings-block">
+                            <h3>語言與時間</h3>
+                            <div class="settings-grid settings-grid-single-mobile">
+                                <div class="settings-item">
+                                    <label for="languageSelect">介面語言</label>
+                                    <select id="languageSelect">
+                                        <option value="zh-Hant">繁體中文</option>
+                                    </select>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="timeFormatSelect">時間格式</label>
+                                    <select id="timeFormatSelect">
+                                        <option value="24h">24 小時制</option>
+                                        <option value="12h">12 小時制</option>
+                                    </select>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="timezoneSelect">時區</label>
+                                    <select id="timezoneSelect">
+                                        <option value="local">跟隨系統</option>
+                                        <option value="Asia/Taipei">Asia/Taipei</option>
+                                        <option value="UTC">UTC</option>
+                                    </select>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="statusIdleSeconds">閒置切換秒數</label>
+                                    <input id="statusIdleSeconds" type="number" min="10" max="3600" step="5" value="60">
+                                    <small class="field-hint">生成結束後，超過此秒數會從線上切換成閒置（預設 60 秒）。</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="settings-status" id="timePreviewText">時間預覽：--:--</div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionToolRegistry" data-settings-panel="toolRegistry" aria-label="註冊工具設定">
+                        <div class="settings-block">
+                            <h3>工具啟用清單</h3>
+                            <div class="toggle-grid settings-toggle-stack">
+                                <label class="toggle-item"><input id="toolVoiceInput" type="checkbox" checked><span>語音輸入</span></label>
+                                <label class="toggle-item"><input id="toolConversationHistory" type="checkbox" checked><span>對話歷史管理</span></label>
+                                <label class="toggle-item"><input id="toolMessageActions" type="checkbox" checked><span>訊息複製/編輯/重作</span></label>
+                                <label class="toggle-item"><input id="toolHealthMonitor" type="checkbox" checked><span>後端健康檢測</span></label>
+                            </div>
+                        </div>
+
+                        <div class="settings-block">
+                            <label>模型路徑</label>
+                            <div class="mono-text" id="modelPath"></div>
+                        </div>
+
+                        <div class="settings-block">
+                            <label>Tokenizer</label>
+                            <div class="mono-text" id="tokenizerPath"></div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+
+            <div class="settings-actions">
+                <button type="button" id="saveSettingsBtn" class="btn solid">儲存</button>
+                <button type="button" id="resetSettingsBtn" class="btn ghost">重設</button>
+            </div>
+        </section>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script id="bootstrap-data" type="application/json">{{ bootstrap | tojson }}</script>
+    <script src="{{ url_for('static', filename='flask-chat.js', v='20260421b30') }}"></script>
+</body>
+</html>
