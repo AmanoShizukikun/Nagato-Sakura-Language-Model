@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>長門櫻 Flask Web UI</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='flask-chat.css', v='20260421b33') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='flask-chat.css', v='20260424b34') }}">
 </head>
 <body>
     <div class="cyber-bg" aria-hidden="true"></div>
@@ -255,9 +255,9 @@
                         <div class="settings-block">
                             <h3>音訊強化</h3>
                             <div class="toggle-grid settings-toggle-stack">
-                                <label class="toggle-item"><input id="avEchoCancellation" type="checkbox"><span>回音消除 (Echo Cancellation)</span></label>
-                                <label class="toggle-item"><input id="avNoiseSuppression" type="checkbox"><span>噪音抑制 (Noise Suppression)</span></label>
-                                <label class="toggle-item"><input id="avAutoGainControl" type="checkbox"><span>自動增益 (Auto Gain Control)</span></label>
+                                <label class="toggle-item"><input id="avEchoCancellation" type="checkbox" class="switch"><span>迴音消除 (Echo Cancellation)</span></label>
+                                <label class="toggle-item"><input id="avNoiseSuppression" type="checkbox" class="switch"><span>噪音抑制 (Noise Suppression)</span></label>
+                                <label class="toggle-item"><input id="avAutoGainControl" type="checkbox" class="switch"><span>自動增益 (Auto Gain Control)</span></label>
                             </div>
 
                             <div class="range-row range-row-spaced">
@@ -302,6 +302,11 @@
                                 <select id="themePreset">
                                     <option value="cyber">Cyber Neon</option>
                                     <option value="sunset">Solar Sunset</option>
+                                    <option value="light">Sakura Light</option>
+                                    <option value="retro">Terminal</option>
+                                    <option value="ocean">Deep Abyss</option>
+                                    <option value="synthwave">Synthwave</option>
+                                    <option value="obsidian">Obsidian</option>
                                 </select>
                             </div>
                             <p class="field-hint">變更後立即套用，儲存後會在下次開啟時保持。</p>
@@ -339,16 +344,17 @@
                         </div>
 
                         <div class="toggle-grid settings-toggle-stack">
-                            <label class="toggle-item"><input id="displayAnimations" type="checkbox" checked><span>啟用介面動畫</span></label>
+                            <label class="toggle-item"><input id="displayAnimations" type="checkbox" class="switch" checked><span>啟用介面動畫</span></label>
+                            <label class="toggle-item"><input id="displayMarkdown" type="checkbox" class="switch" checked><span>啟用 Markdown 渲染</span></label>
                         </div>
 
                         <div class="settings-block">
                             <h3>訊息 Meta 顯示欄位</h3>
                             <div class="toggle-grid settings-toggle-stack">
-                                <label class="toggle-item"><input id="displayMetaTokensPerSec" type="checkbox" checked><span>生成速度 token/s</span></label>
-                                <label class="toggle-item"><input id="displayMetaTokens" type="checkbox" checked><span>生成 tokens 數</span></label>
-                                <label class="toggle-item"><input id="displayMetaElapsed" type="checkbox" checked><span>生成時間</span></label>
-                                <label class="toggle-item"><input id="displayMetaStopReason" type="checkbox" checked><span>停止原因</span></label>
+                                <label class="toggle-item"><input id="displayMetaTokensPerSec" type="checkbox" class="custom-check" checked><span>生成速度 token/s</span></label>
+                                <label class="toggle-item"><input id="displayMetaTokens" type="checkbox" class="custom-check" checked><span>生成 tokens 數</span></label>
+                                <label class="toggle-item"><input id="displayMetaElapsed" type="checkbox" class="custom-check" checked><span>生成時間</span></label>
+                                <label class="toggle-item"><input id="displayMetaStopReason" type="checkbox" class="custom-check" checked><span>停止原因</span></label>
                             </div>
                             <p class="field-hint">控制 message-actions 內的 message-meta-info 顯示內容，切換後會即時更新聊天室。</p>
                         </div>
@@ -358,10 +364,10 @@
                         <div class="settings-block">
                             <h3>輸入與快捷</h3>
                             <div class="toggle-grid settings-toggle-stack">
-                                <label class="toggle-item"><input id="shortcutEnterToSend" type="checkbox" checked><span>Enter 送出訊息</span></label>
-                                <label class="toggle-item"><input id="shortcutEscClosePanels" type="checkbox" checked><span>ESC 關閉設定與側欄</span></label>
-                                <label class="toggle-item"><input id="shortcutSlashFocusInput" type="checkbox" checked><span>/ 快速聚焦輸入框</span></label>
-                                <label class="toggle-item"><input id="doSample" type="checkbox" checked><span>啟用採樣生成</span></label>
+                                <label class="toggle-item"><input id="shortcutEnterToSend" type="checkbox" class="custom-check" checked><span>Enter 送出訊息</span></label>
+                                <label class="toggle-item"><input id="shortcutEscClosePanels" type="checkbox" class="custom-check" checked><span>ESC 關閉設定與側欄</span></label>
+                                <label class="toggle-item"><input id="shortcutSlashFocusInput" type="checkbox" class="custom-check" checked><span>/ 快速聚焦輸入框</span></label>
+                                <label class="toggle-item"><input id="doSample" type="checkbox" class="switch" checked><span>啟用採樣生成</span></label>
                             </div>
                         </div>
                     </section>
@@ -405,10 +411,10 @@
                         <div class="settings-block">
                             <h3>工具啟用清單</h3>
                             <div class="toggle-grid settings-toggle-stack">
-                                <label class="toggle-item"><input id="toolVoiceInput" type="checkbox" checked><span>語音輸入</span></label>
-                                <label class="toggle-item"><input id="toolConversationHistory" type="checkbox" checked><span>對話歷史管理</span></label>
-                                <label class="toggle-item"><input id="toolMessageActions" type="checkbox" checked><span>訊息複製/編輯/重作</span></label>
-                                <label class="toggle-item"><input id="toolHealthMonitor" type="checkbox" checked><span>後端健康檢測</span></label>
+                                <label class="toggle-item"><input id="toolVoiceInput" type="checkbox" class="switch" checked><span>語音輸入</span></label>
+                                <label class="toggle-item"><input id="toolConversationHistory" type="checkbox" class="switch" checked><span>對話歷史管理</span></label>
+                                <label class="toggle-item"><input id="toolMessageActions" type="checkbox" class="switch" checked><span>訊息複製/編輯/重作</span></label>
+                                <label class="toggle-item"><input id="toolHealthMonitor" type="checkbox" class="switch" checked><span>後端健康檢測</span></label>
                             </div>
                         </div>
 
@@ -435,6 +441,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <script id="bootstrap-data" type="application/json">{{ bootstrap | tojson }}</script>
-    <script src="{{ url_for('static', filename='flask-chat.js', v='20260421b30') }}"></script>
+    <script src="{{ url_for('static', filename='flask-chat.js', v='20260424b31') }}"></script>
 </body>
 </html>

@@ -13,6 +13,15 @@
 由於設備性能問題，目前以小巧高性能 60M 參數模型為目標開發模型中。
 
 ## 近期變動
+### 1.3.1 (2026 年 4 月 26 日)
+![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/preview/1.3.jpg)
+### 重要變更
+- 【重大】調整 tokenizer 新增加更多保底符號。
+### 新增功能
+- 【更新】改進 webui 頁面顯示效果，以及更多功能選項。
+### 已知問題
+- N/A
+
 ### 1.2.0 (2026 年 4 月 17 日)
 ![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/preview/1.2.0.jpg)
 ### 重要變更
@@ -52,6 +61,27 @@
 git clone https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model.git
 cd Nagato-Sakura-Language-Model
 pip install -r requirements.txt
+```
+
+## 進行模型訓練
+```shell
+python train.py
+```
+
+## Cli 推理
+```shell
+python inference.py --mode interactive --model_path 你的模型資料夾路徑
+```
+
+## Web 推理
+### 方式 1：透過 inference.py（建議）
+```shell
+python inference.py --mode web --model_path 你的模型資料夾路徑
+```
+
+### 方式 2：直接啟動腳本
+```shell
+python tools/web_demo_flask.py --model_path 你的模型資料夾路徑
 ```
 
 ## 待辦事項

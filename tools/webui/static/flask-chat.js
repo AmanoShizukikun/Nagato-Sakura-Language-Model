@@ -190,6 +190,7 @@ const refs = {
     displayChatUiMode: document.getElementById("displayChatUiMode"),
     displayDensity: document.getElementById("displayDensity"),
     displayAnimations: document.getElementById("displayAnimations"),
+    displayMarkdown: document.getElementById("displayMarkdown"),
     displayMetaTokensPerSec: document.getElementById("displayMetaTokensPerSec"),
     displayMetaTokens: document.getElementById("displayMetaTokens"),
     displayMetaElapsed: document.getElementById("displayMetaElapsed"),
@@ -346,11 +347,12 @@ function getDefaultSettings() {
         },
         uiState: {
             activeSection: pickString(uiDefaults.activeSection, DEFAULT_ACTIVE_SETTINGS_SECTION, SETTINGS_SECTIONS),
-            themePreset: pickString(uiDefaults.themePreset, "cyber", ["cyber", "sunset"]),
+            themePreset: pickString(uiDefaults.themePreset, "cyber", ["cyber", "sunset", "light", "retro", "ocean", "synthwave", "obsidian"]),
             displayFontScale: clampNumber(uiDefaults.displayFontScale, 1, { min: 0.9, max: 1.3, digits: 2 }),
             chatUiMode: pickString(uiDefaults.chatUiMode, "bubbleOnly", CHAT_UI_MODES),
             displayDensity: pickString(uiDefaults.displayDensity, "normal", ["compact", "normal", "relaxed"]),
             displayAnimations: boolValue(uiDefaults.displayAnimations, true),
+            displayMarkdown: boolValue(uiDefaults.displayMarkdown, true),
             metaShowTokensPerSec: boolValue(uiDefaults.metaShowTokensPerSec, true),
             metaShowTokens: boolValue(uiDefaults.metaShowTokens, true),
             metaShowElapsed: boolValue(uiDefaults.metaShowElapsed, true),
@@ -408,11 +410,12 @@ function sanitizeSettings(rawSettings) {
     normalized.params.doSample = boolValue(params.doSample ?? params.do_sample, defaults.params.doSample);
 
     normalized.uiState.activeSection = pickString(uiState.activeSection, defaults.uiState.activeSection, SETTINGS_SECTIONS);
-    normalized.uiState.themePreset = pickString(uiState.themePreset, defaults.uiState.themePreset, ["cyber", "sunset"]);
+    normalized.uiState.themePreset = pickString(uiState.themePreset, defaults.uiState.themePreset, ["cyber", "sunset", "light", "retro", "ocean", "synthwave", "obsidian"]);
     normalized.uiState.displayFontScale = clampNumber(uiState.displayFontScale, defaults.uiState.displayFontScale, { min: 0.9, max: 1.3, digits: 2 });
     normalized.uiState.chatUiMode = pickString(uiState.chatUiMode, defaults.uiState.chatUiMode, CHAT_UI_MODES);
     normalized.uiState.displayDensity = pickString(uiState.displayDensity, defaults.uiState.displayDensity, ["compact", "normal", "relaxed"]);
     normalized.uiState.displayAnimations = boolValue(uiState.displayAnimations, defaults.uiState.displayAnimations);
+    normalized.uiState.displayMarkdown = boolValue(uiState.displayMarkdown, defaults.uiState.displayMarkdown);
     normalized.uiState.metaShowTokensPerSec = boolValue(uiState.metaShowTokensPerSec, defaults.uiState.metaShowTokensPerSec);
     normalized.uiState.metaShowTokens = boolValue(uiState.metaShowTokens, defaults.uiState.metaShowTokens);
     normalized.uiState.metaShowElapsed = boolValue(uiState.metaShowElapsed, defaults.uiState.metaShowElapsed);
@@ -509,7 +512,7 @@ function setActiveSettingsSection(sectionKey, persist = true) {
 }
 
 function applyThemePreset(themePreset) {
-    const resolved = pickString(themePreset, "cyber", ["cyber", "sunset"]);
+    const resolved = pickString(themePreset, "cyber", ["cyber", "sunset", "light", "retro", "ocean", "synthwave", "obsidian"]);
     document.body.setAttribute("data-theme", resolved);
 }
 
@@ -658,6 +661,9 @@ function applySettingsToUI() {
     }
     refs.displayDensity.value = state.settings.uiState.displayDensity;
     refs.displayAnimations.checked = Boolean(state.settings.uiState.displayAnimations);
+    if (refs.displayMarkdown) {
+        refs.displayMarkdown.checked = Boolean(state.settings.uiState.displayMarkdown);
+    }
     if (refs.displayMetaTokensPerSec) {
         refs.displayMetaTokensPerSec.checked = Boolean(state.settings.uiState.metaShowTokensPerSec);
     }
@@ -722,6 +728,7 @@ function syncSettingsFromUi() {
     );
     state.settings.uiState.displayDensity = refs.displayDensity.value;
     state.settings.uiState.displayAnimations = Boolean(refs.displayAnimations.checked);
+    state.settings.uiState.displayMarkdown = Boolean(refs.displayMarkdown ? refs.displayMarkdown.checked : state.settings.uiState.displayMarkdown);
     state.settings.uiState.metaShowTokensPerSec = Boolean(refs.displayMetaTokensPerSec ? refs.displayMetaTokensPerSec.checked : state.settings.uiState.metaShowTokensPerSec);
     state.settings.uiState.metaShowTokens = Boolean(refs.displayMetaTokens ? refs.displayMetaTokens.checked : state.settings.uiState.metaShowTokens);
     state.settings.uiState.metaShowElapsed = Boolean(refs.displayMetaElapsed ? refs.displayMetaElapsed.checked : state.settings.uiState.metaShowElapsed);
@@ -1697,8 +1704,8 @@ function normalizeMessageMarkdownText(rawText) {
         return "";
     }
 
-    // Some model outputs include escaped newlines in a single line fenced block.
-    if (text.includes("```") && text.includes("\\n") && !text.includes("\n")) {
+    // Some model outputs include escaped control characters in a single line response.
+    if (text.includes("\\n") && !text.includes("\n")) {
         return text
             .replace(/\\r\\n/g, "\n")
             .replace(/\\n/g, "\n")
@@ -1759,6 +1766,113 @@ function appendCodeContentBlock(contentNode, codeText, language = "") {
     contentNode.appendChild(codeWrap);
 }
 
+function escapeHtml(text) {
+    return String(text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function sanitizeMarkdownUrl(rawUrl) {
+    const value = String(rawUrl || "").trim();
+    if (!value) {
+        return "";
+    }
+
+    try {
+        const resolved = new URL(value, window.location.origin);
+        const protocol = resolved.protocol.toLowerCase();
+        if (protocol === "http:" || protocol === "https:" || protocol === "mailto:" || protocol === "tel:") {
+            return resolved.href;
+        }
+    } catch {
+        return "";
+    }
+
+    return "";
+}
+
+function renderInlineMarkdownHtml(rawText) {
+    const segments = String(rawText || "").split(/(`[^`\n]+`)/g);
+
+    return segments.map((segment) => {
+        if (!segment) {
+            return "";
+        }
+
+        if (segment.startsWith("`") && segment.endsWith("`")) {
+            return `<code>${escapeHtml(segment.slice(1, -1))}</code>`;
+        }
+
+        let html = escapeHtml(segment);
+
+        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, url) => {
+            const safeUrl = sanitizeMarkdownUrl(url);
+            if (!safeUrl) {
+                return escapeHtml(match);
+            }
+            return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+        });
+        html = html.replace(/\*\*([\s\S]+?)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/__([\s\S]+?)__/g, "<strong>$1</strong>");
+        html = html.replace(/~~([\s\S]+?)~~/g, "<del>$1</del>");
+
+        return html;
+    }).join("");
+}
+
+function appendMarkdownHtmlBlock(contentNode, tagName, markdownText, className = "") {
+    const node = document.createElement(tagName);
+    if (className) {
+        node.className = className;
+    }
+    node.innerHTML = renderInlineMarkdownHtml(markdownText);
+    contentNode.appendChild(node);
+}
+
+function appendMarkdownParagraph(contentNode, lines) {
+    const paragraphText = lines
+        .map((line) => String(line || "").trim())
+        .filter((line) => line.length > 0)
+        .join(" ");
+
+    if (!paragraphText) {
+        return;
+    }
+
+    appendMarkdownHtmlBlock(contentNode, "p", paragraphText, "content-paragraph");
+}
+
+function appendMarkdownHeading(contentNode, level, markdownText) {
+    const headingLevel = Math.min(6, Math.max(1, Number(level) || 1));
+    appendMarkdownHtmlBlock(contentNode, `h${headingLevel}`, markdownText, "content-heading");
+}
+
+function appendMarkdownBlockquote(contentNode, lines) {
+    const quoteLines = lines
+        .map((line) => String(line || "").trim())
+        .filter((line) => line.length > 0);
+
+    if (!quoteLines.length) {
+        return;
+    }
+
+    const blockquote = document.createElement("blockquote");
+    blockquote.className = "content-quote";
+    blockquote.innerHTML = quoteLines.map((line) => renderInlineMarkdownHtml(line)).join("<br>");
+    contentNode.appendChild(blockquote);
+}
+
+
+
+function appendMarkdownRule(contentNode) {
+    const rule = document.createElement("hr");
+    rule.className = "content-rule";
+    contentNode.appendChild(rule);
+}
+
 function renderMessageContent(contentNode, rawText) {
     const text = normalizeMessageMarkdownText(rawText);
     contentNode.innerHTML = "";
@@ -1767,23 +1881,263 @@ function renderMessageContent(contentNode, rawText) {
         return;
     }
 
-    const fenceRegex = /```([a-zA-Z0-9_+-]*)[ \t]*\n?([\s\S]*?)```/g;
-    let cursor = 0;
-    let match;
+    const useMarkdown = state.settings ? state.settings.uiState.displayMarkdown !== false : true;
 
-    while ((match = fenceRegex.exec(text)) !== null) {
-        const prefixText = text.slice(cursor, match.index);
-        appendPlainContentBlock(contentNode, prefixText);
-
-        const language = match[1] || "";
-        const codeBody = match[2] || "";
-        appendCodeContentBlock(contentNode, codeBody, language);
-
-        cursor = fenceRegex.lastIndex;
+    if (!useMarkdown) {
+        appendPlainContentBlock(contentNode, text);
+        return;
     }
 
-    const suffixText = text.slice(cursor);
-    appendPlainContentBlock(contentNode, suffixText);
+    const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+    const paragraphLines = [];
+    const quoteLines = [];
+    let listStack = [];
+    let tableState = null;
+    let codeState = null;
+
+    const flushParagraph = () => {
+        if (paragraphLines.length) {
+            appendMarkdownParagraph(contentNode, paragraphLines);
+            paragraphLines.length = 0;
+        }
+    };
+
+    const flushQuote = () => {
+        if (quoteLines.length) {
+            appendMarkdownBlockquote(contentNode, quoteLines);
+            quoteLines.length = 0;
+        }
+    };
+
+    const flushList = () => {
+        listStack = [];
+    };
+
+    const flushTable = () => {
+        tableState = null;
+    };
+
+    const flushOpenBlocks = () => {
+        flushParagraph();
+        flushQuote();
+        flushList();
+        flushTable();
+    };
+
+    for (const line of lines) {
+        const trimmedLine = line.trim();
+
+        if (codeState) {
+            if (trimmedLine.startsWith("```")) {
+                appendCodeContentBlock(contentNode, codeState.lines.join("\n"), codeState.language);
+                codeState = null;
+            } else {
+                codeState.lines.push(line);
+            }
+            continue;
+        }
+
+        const fenceMatch = trimmedLine.match(/^```([a-zA-Z0-9_+-]*)\s*$/);
+        if (fenceMatch) {
+            flushOpenBlocks();
+            codeState = {
+                language: fenceMatch[1] || "",
+                lines: [],
+            };
+            continue;
+        }
+
+        if (!trimmedLine) {
+            flushOpenBlocks();
+            continue;
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+            flushOpenBlocks();
+            appendMarkdownHeading(contentNode, headingMatch[1].length, headingMatch[2]);
+            continue;
+        }
+
+        if (/^[-*_]{3,}$/.test(trimmedLine.replace(/\s+/g, ""))) {
+            flushOpenBlocks();
+            appendMarkdownRule(contentNode);
+            continue;
+        }
+
+        const isTableLine = trimmedLine.startsWith("|") && trimmedLine.endsWith("|") && trimmedLine.length > 1;
+        if (isTableLine) {
+            const isSeparator = /^\|[\s-|:]+\|$/.test(trimmedLine);
+            const cells = trimmedLine.slice(1, -1).split("|");
+
+            if (!tableState) {
+                if (!isSeparator) {
+                    flushOpenBlocks();
+                    const tableNode = document.createElement("table");
+                    tableNode.className = "content-table";
+                    tableNode._rawLines = [trimmedLine];
+                    
+                    const thead = document.createElement("thead");
+                    const tr = document.createElement("tr");
+                    for (const cell of cells) {
+                        const th = document.createElement("th");
+                        th.innerHTML = renderInlineMarkdownHtml(cell.trim());
+                        tr.appendChild(th);
+                    }
+                    thead.appendChild(tr);
+                    tableNode.appendChild(thead);
+                    
+                    const tbody = document.createElement("tbody");
+                    tableNode.appendChild(tbody);
+                    
+                    const wrapper = document.createElement("div");
+                    wrapper.className = "content-code-block";
+
+                    const head = document.createElement("div");
+                    head.className = "content-code-head";
+
+                    const langSpan = document.createElement("span");
+                    langSpan.className = "content-code-lang";
+                    langSpan.textContent = "table";
+
+                    const copyBtn = document.createElement("button");
+                    copyBtn.className = "content-code-copy-btn";
+                    copyBtn.title = "複製表格內容";
+                    copyBtn.innerHTML = `
+                        <svg class="content-code-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                    `;
+
+                    copyBtn.addEventListener("click", () => {
+                        const markdownText = tableNode._rawLines.join("\n");
+                        
+                        navigator.clipboard.writeText(markdownText).then(() => {
+                            const originalHtml = copyBtn.innerHTML;
+                            copyBtn.innerHTML = `
+                                <svg class="content-code-copy-icon" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="20 6 9 17 4 12"></polyline>
+                                </svg>
+                            `;
+                            setTimeout(() => {
+                                copyBtn.innerHTML = originalHtml;
+                            }, 2000);
+                        });
+                    });
+
+                    head.appendChild(langSpan);
+                    head.appendChild(copyBtn);
+
+                    const tableWrap = document.createElement("div");
+                    tableWrap.className = "content-table-wrap";
+                    tableWrap.appendChild(tableNode);
+
+                    wrapper.appendChild(head);
+                    wrapper.appendChild(tableWrap);
+                    contentNode.appendChild(wrapper);
+                    
+                    tableState = { tableNode, tbodyNode: tbody };
+                    continue;
+                }
+            } else {
+                if (isSeparator) {
+                    tableState.tableNode._rawLines.push(trimmedLine);
+                    continue;
+                }
+                tableState.tableNode._rawLines.push(trimmedLine);
+                const tr = document.createElement("tr");
+                for (const cell of cells) {
+                    const td = document.createElement("td");
+                    td.innerHTML = renderInlineMarkdownHtml(cell.trim());
+                    tr.appendChild(td);
+                }
+                tableState.tbodyNode.appendChild(tr);
+                continue;
+            }
+        } else if (tableState) {
+            flushTable();
+        }
+
+        const orderedMatch = trimmedLine.match(/^(\d+)\.\s+(.*)$/);
+        const unorderedMatch = trimmedLine.match(/^[-*+]\s+(.*)$/);
+        if (orderedMatch || unorderedMatch) {
+            flushParagraph();
+            flushQuote();
+
+            const nextType = orderedMatch ? "ol" : "ul";
+            const indent = line.length - line.trimStart().length;
+            const itemText = (orderedMatch ? orderedMatch[2] : unorderedMatch[1]).trim();
+            const startNum = orderedMatch ? Number(orderedMatch[1]) : 1;
+
+            while (listStack.length > 0) {
+                const top = listStack[listStack.length - 1];
+                if (top.indent > indent) {
+                    listStack.pop();
+                } else if (top.indent === indent && top.type !== nextType) {
+                    listStack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            let topList = listStack.length > 0 ? listStack[listStack.length - 1] : null;
+
+            if (!topList || topList.indent < indent) {
+                const listNode = document.createElement(nextType);
+                listNode.className = "content-list";
+                if (nextType === "ol" && startNum > 1) {
+                    listNode.start = startNum;
+                }
+
+                if (topList && topList.lastLi) {
+                    topList.lastLi.appendChild(listNode);
+                } else {
+                    contentNode.appendChild(listNode);
+                }
+
+                topList = {
+                    indent: indent,
+                    type: nextType,
+                    listNode: listNode,
+                    lastLi: null
+                };
+                listStack.push(topList);
+            }
+
+            const li = document.createElement("li");
+            li.innerHTML = renderInlineMarkdownHtml(itemText);
+            topList.listNode.appendChild(li);
+            topList.lastLi = li;
+
+            continue;
+        }
+
+        if (line.trimStart().startsWith(">")) {
+            flushParagraph();
+            flushList();
+            quoteLines.push(line.replace(/^\s*>\s?/, ""));
+            continue;
+        }
+
+        if (quoteLines.length) {
+            flushQuote();
+        }
+        if (listStack.length > 0) {
+            flushList();
+        }
+        if (tableState) {
+            flushTable();
+        }
+
+        paragraphLines.push(line);
+    }
+
+    if (codeState) {
+        appendCodeContentBlock(contentNode, codeState.lines.join("\n"), codeState.language);
+    }
+
+    flushOpenBlocks();
 
     // If no blocks were appended (edge case), keep plain text rendering.
     if (!contentNode.childNodes.length) {

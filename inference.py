@@ -800,7 +800,7 @@ def main():
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-1.3/checkpoint-epoch-12", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-1.3/checkpoint-epoch-10", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式

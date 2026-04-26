@@ -217,6 +217,7 @@ def index():
             "chatUiMode": "bubbleOnly",
             "displayDensity": "normal",
             "displayAnimations": True,
+            "displayMarkdown": True,
             "metaShowTokensPerSec": True,
             "metaShowTokens": True,
             "metaShowElapsed": True,
