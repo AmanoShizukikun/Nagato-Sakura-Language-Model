@@ -7,14 +7,16 @@
 \[ 中文 | [English](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/docs/README_en.md) | [日本語](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/docs/README_jp.md) \]
 
 ## 簡介
-「長門櫻-語言模型」是「長門櫻計畫」的衍生，是作為「長門櫻」底層的語言模型，實現自然語言處理功能。
+「長門櫻-語言模型」是「長門櫻計畫」的衍生，是作為「長門櫻」底層的語言模型，本項目旨在從零用 sft 對話資料打造一個超輕量化可本地部屬的語言模型僅需要0.5GB VRAM 就能運行。
 
 ## 公告
-由於設備性能問題，目前以小巧高性能 60M 參數模型為目標開發模型中。
+- 本模型不支援 HuggingFace 格式僅能透過 github 下載推理程式進行推理。
+- 由於開發者設備性能有限(單卡 RTX 3070 8GB)，所以本項目為實驗性質以 60M 模型參數開發。
+- 模型僅支援繁體中文，並對英文、日文僅提供最低識字。
 
 ## 近期變動
-### 1.3.1 (2026 年 4 月 26 日)
-![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/preview/1.3.jpg)
+### 1.3.0 (2026 年 4 月 26 日)
+![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/preview/1.2.0.jpg)
 ### 重要變更
 - 【重大】調整 tokenizer 新增加更多保底符號。
 ### 新增功能
@@ -25,7 +27,7 @@
 ### 1.2.0 (2026 年 4 月 17 日)
 ![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/preview/1.2.0.jpg)
 ### 重要變更
-- 【重大】
+- 【重大】首個正式發布版本。
 ### 新增功能
 - 【新增】inference.py 新增臨時聊天模式。
 - 【新增】inference.py 新增量化功能(由於參數過小不建議開啟)。
@@ -74,6 +76,7 @@ python inference.py --mode interactive --model_path 你的模型資料夾路徑
 ```
 
 ## Web 推理
+![t2i](https://github.com/AmanoShizukikun/Nagato-Sakura-Language-Model/blob/main/assets/samples/webui_1.jpg)
 ### 方式 1：透過 inference.py（建議）
 ```shell
 python inference.py --mode web --model_path 你的模型資料夾路徑
