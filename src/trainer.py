@@ -782,8 +782,15 @@ class AdvancedNagatoSakuraTrainer:
         tokenizer_num_threads: int = 0,
         tokenizer_enable_universal_charset: bool = True,
         tokenizer_extra_chars_files: Optional[List[str]] = None,
+        tokenizer_random_sampling: bool = True,
+        tokenizer_sample_ratio: float = 0.5,
     ) -> Tuple[List[Dict[str, str]], Optional[List[Dict[str, str]]]]:
-        """準備訓練/評估數據並訓練分詞器。"""
+        """準備訓練/評估數據並訓練分詞器。
+        
+        參數:
+            tokenizer_random_sampling: 是否對大規模數據進行隨機採樣
+            tokenizer_sample_ratio: 隨機採樣比率 (0.0-1.0)，當數據超過 10 萬時自動應用
+        """
 
         self.logger.info(f"從 {training_data_file} 加載訓練數據...")
         train_data = self._load_supervised_data_file(training_data_file, "訓練數據")
@@ -823,6 +830,8 @@ class AdvancedNagatoSakuraTrainer:
             num_threads=tokenizer_num_threads,
             enable_universal_charset=tokenizer_enable_universal_charset,
             extra_chars_files=tokenizer_extra_chars_files,
+            tokenizer_random_sampling=tokenizer_random_sampling,
+            tokenizer_sample_ratio=tokenizer_sample_ratio,
         )
 
         return train_data, fixed_eval_data

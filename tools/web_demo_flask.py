@@ -26,7 +26,6 @@ from inference import InferenceConfig, NagatoSakuraInference
 
 INFERENCE_INSTANCE: NagatoSakuraInference | None = None
 INFERENCE_INIT_LOCK = Lock()
-INFERENCE_RUN_LOCK = Lock()
 RUNTIME_ARGS: argparse.Namespace | None = None
 WHISPER_MODEL = None
 WHISPER_INIT_LOCK = Lock()
@@ -38,6 +37,14 @@ app = Flask(
     static_folder=str(WEBUI_DIR / "static"),
 )
 app.config["JSON_AS_ASCII"] = False
+
+
+@app.after_request
+def _fix_js_mime(response):
+    """Ensure .js static files are served with correct MIME type for ES modules."""
+    if request.path.endswith(".js") and request.path.startswith("/static/"):
+        response.headers["Content-Type"] = "application/javascript; charset=utf-8"
+    return response
 
 
 def _resolve_path(path_text: str) -> Path:
@@ -366,53 +373,44 @@ def api_chat():
         return jsonify({"error": "Prompt 為空，請重試"}), 400
 
     def generate_stream():
-        with INFERENCE_RUN_LOCK:
-            inference.config.max_length = max_length
-            inference.config.max_new_tokens = max_new_tokens
-            inference.config.temperature = temperature
-            inference.config.top_k = top_k
-            inference.config.top_p = top_p
-            inference.config.repetition_penalty = repetition_penalty
-            inference.config.do_sample = do_sample
-            inference.config.stateless_chat = stateless_chat
+        started_at = time.time()
+        final_text = ""
 
-            started_at = time.time()
-            final_text = ""
+        try:
+            for output in inference.stream_generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                do_sample=do_sample,
+            ):
+                if output.get("finished", False):
+                    elapsed = time.time() - started_at
+                    if output.get("error", False):
+                        message_text = str(output.get("delta", "生成失敗"))
+                        yield _jsonl_line({"type": "error", "message": message_text, "done": True})
+                    else:
+                        final_text = str(output.get("full_response", final_text))
+                        yield _jsonl_line(
+                            {
+                                "type": "done",
+                                "done": True,
+                                "text": final_text,
+                                "elapsed": elapsed,
+                                "tokens": int(output.get("tokens_generated", 0)),
+                                "stop_reason": str(output.get("stop_reason", "completed")),
+                            }
+                        )
+                    return
 
-            try:
-                for output in inference.stream_generate(
-                    prompt,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    do_sample=do_sample,
-                ):
-                    if output.get("finished", False):
-                        elapsed = time.time() - started_at
-                        if output.get("error", False):
-                            message_text = str(output.get("delta", "生成失敗"))
-                            yield _jsonl_line({"type": "error", "message": message_text, "done": True})
-                        else:
-                            final_text = str(output.get("full_response", final_text))
-                            yield _jsonl_line(
-                                {
-                                    "type": "done",
-                                    "done": True,
-                                    "text": final_text,
-                                    "elapsed": elapsed,
-                                    "tokens": int(output.get("tokens_generated", 0)),
-                                    "stop_reason": str(output.get("stop_reason", "completed")),
-                                }
-                            )
-                        return
-
-                    delta = str(output.get("delta", ""))
-                    if delta:
-                        final_text += delta
-                        yield _jsonl_line({"type": "delta", "delta": delta})
-            except Exception as e:
+                delta = str(output.get("delta", ""))
+                if delta:
+                    final_text += delta
+                    yield _jsonl_line({"type": "delta", "delta": delta})
+        except Exception as e:
                 yield _jsonl_line({"type": "error", "message": f"生成例外: {e}", "done": True})
 
     return Response(

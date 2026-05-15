@@ -32,21 +32,21 @@ class InferenceConfig:
     model_path: str
     tokenizer_path: str
     device: str = "auto"
-    max_length: Optional[int] = None  # None=自動使用模型 max_position_embeddings
-    max_new_tokens: int = 512
+    max_length: Optional[int] = None
+    max_new_tokens: int = 4096
     temperature: float = 0.7
     top_k: int = 50
     top_p: float = 0.9
     repetition_penalty: float = 1.0
     do_sample: bool = True
     base_seed: int = -1
-    silent_mode: bool = True  # 靜默模式，不顯示內存監控信息
+    silent_mode: bool = True
     quantize_kv_cache: Optional[bool] = None
     kv_cache_bits: Optional[int] = None
     kv_quant_group_size: Optional[int] = None
     kv_residual_sign_correction: Optional[bool] = None
     num_key_value_heads: Optional[int] = None
-    stateless_chat: bool = False  # 臨時聊天模式，每一輪都視為新對話
+    stateless_chat: bool = False
 
 class ColoredFormatter(logging.Formatter):
     """彩色日誌格式器"""
@@ -91,12 +91,15 @@ class RandomSeedManager:
         else:
             self.base_seed = base_seed
         self.counter = 0
+        import threading
+        self.lock = threading.Lock()
         
     def get_new_seed(self) -> int:
         """獲取新的隨機種子"""
-        new_seed = (self.base_seed + self.counter + random.randint(1, 10000)) % (2**32)
-        self.counter += 1
-        return new_seed
+        with self.lock:
+            new_seed = (self.base_seed + self.counter + random.randint(1, 10000)) % (2**32)
+            self.counter += 1
+            return new_seed
 
 class NagatoSakuraInference:
     """長門櫻模型流式推理器"""
@@ -186,6 +189,18 @@ class NagatoSakuraInference:
             model_config.eos_token_id = self.tokenizer.eos_token_id
             model_config.unk_token_id = self.tokenizer.unk_token_id
 
+            # 將未指定的推理參數預設為模型配置中的值（讓推理預設跟隨 model config）
+            if getattr(self.config, "num_key_value_heads", None) is None and hasattr(model_config, "num_key_value_heads"):
+                self.config.num_key_value_heads = model_config.num_key_value_heads
+            if getattr(self.config, "quantize_kv_cache", None) is None and hasattr(model_config, "quantize_kv_cache"):
+                self.config.quantize_kv_cache = model_config.quantize_kv_cache
+            if getattr(self.config, "kv_cache_bits", None) is None and hasattr(model_config, "kv_cache_bits"):
+                self.config.kv_cache_bits = model_config.kv_cache_bits
+            if getattr(self.config, "kv_quant_group_size", None) is None and hasattr(model_config, "kv_quant_group_size"):
+                self.config.kv_quant_group_size = model_config.kv_quant_group_size
+            if getattr(self.config, "kv_residual_sign_correction", None) is None and hasattr(model_config, "kv_residual_sign_correction"):
+                self.config.kv_residual_sign_correction = model_config.kv_residual_sign_correction
+
             # 套用命令列覆寫（0.5.0）
             if self.config.num_key_value_heads is not None:
                 model_config.num_key_value_heads = self.config.num_key_value_heads
@@ -255,8 +270,7 @@ class NagatoSakuraInference:
                 )
             else:
                 self.logger.info("Tokenizer檔案: 未找到（不影響模型參數統計）")
-
-            # 詳細拆分放在 DEBUG，避免預設輸出過於冗長。
+                
             self.logger.debug(f"可訓練參數: {param_stats['trainable_params']/1e6:.2f}M")
             self.logger.debug(
                 f"Embedding矩陣: {param_stats['vocab_size']} x {param_stats['hidden_size']}"
@@ -304,7 +318,7 @@ class NagatoSakuraInference:
         
         try:
             max_context_len = int(
-                self.config.max_length
+                kwargs.get("max_length") or self.config.max_length
                 or getattr(self.model.config, "max_position_embeddings", 512)
             )
 
@@ -800,7 +814,7 @@ def main():
     parser = argparse.ArgumentParser(description="長門櫻模型流式推理程序")
     
     # 必需參數
-    parser.add_argument("--model_path", type=str, default="NS-LLM-1.3/checkpoint-epoch-10", help="模型路徑")
+    parser.add_argument("--model_path", type=str, default="NS-LLM-1.4/best_model", help="模型路徑")
     parser.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     
     # 推理模式
@@ -810,7 +824,7 @@ def main():
     
     # 單次推理參數
     parser.add_argument("--prompt", type=str, help="單次推理的輸入提示")
-    parser.add_argument("--max_new_tokens", type=int, default=512, help="最大新生成token數")
+    parser.add_argument("--max_new_tokens", type=int, default=4096, help="最大新生成token數")
     parser.add_argument("--max_length", type=int, default=0, help="推理上下文上限（0=自動使用模型 max_position_embeddings）")
     
     # 生成參數
@@ -820,7 +834,7 @@ def main():
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="重複懲罰")
     parser.add_argument("--no_sample", action="store_true", help="禁用採樣（使用貪婪解碼）")
 
-    # 0.5.0 量化/架構覆寫
+    # 量化/架構覆寫
     parser.add_argument("--quantize_kv_cache", action="store_true", help="啟用 KV cache 量化")
     parser.add_argument("--kv_cache_bits", type=int, choices=[3, 4, 8, 16, 32], help="KV cache 位寬")
     parser.add_argument("--kv_quant_group_size", type=int, help="KV 量化分組大小")

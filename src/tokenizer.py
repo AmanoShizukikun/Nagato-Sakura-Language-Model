@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import string
 import unicodedata
 from pathlib import Path
@@ -965,6 +966,25 @@ class TokenizerManager:
         guaranteed_tokens: Optional[List[str]] = None,
     ):
         """創建並訓練分詞器"""
+        # 記憶體監控
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_info_before = process.memory_info()
+            mem_percent_before = process.memory_percent()
+            self.logger.info(
+                f"分詞器訓練前記憶體: {mem_info_before.rss / 1024 / 1024:.1f}MB "
+                f"({mem_percent_before:.1f}%)"
+            )
+            if total_texts and total_texts > 500_000:
+                self.logger.warning(
+                    f"即將訓練大規模分詞器 ({total_texts} 文本)。"
+                    f"記憶體使用率 {mem_percent_before:.1f}%。"
+                    f"若記憶體不足，請使用 --tokenizer_train_max_samples 或 --tokenizer_sample_ratio 限制樣本。"
+                )
+        except ImportError:
+            pass
+        
         previous_tokenizers_parallelism = os.environ.get("TOKENIZERS_PARALLELISM")
         previous_rayon_threads = os.environ.get("RAYON_NUM_THREADS")
         tokenizers_parallelism_override_applied = False
@@ -1055,6 +1075,20 @@ class TokenizerManager:
             actual_vocab_size = len(self.transformers_tokenizer)
             self.logger.info(f"分詞器訓練完成，實際詞彙量: {actual_vocab_size}")
             
+            # 訓練後記憶體監控
+            try:
+                import psutil
+                process = psutil.Process(os.getpid())
+                mem_info_after = process.memory_info()
+                mem_percent_after = process.memory_percent()
+                mem_delta_mb = (mem_info_after.rss - mem_info_before.rss) / 1024 / 1024
+                self.logger.info(
+                    f"分詞器訓練後記憶體: {mem_info_after.rss / 1024 / 1024:.1f}MB "
+                    f"({mem_percent_after:.1f}%, Δ {mem_delta_mb:+.1f}MB)"
+                )
+            except Exception:
+                pass
+            
         except Exception as e:
             self.logger.error(f"分詞器訓練失敗: {e}")
             raise
@@ -1080,6 +1114,8 @@ class TokenizerManager:
         num_threads: int = 0,
         enable_universal_charset: bool = True,
         extra_chars_files: Optional[List[str]] = None,
+        tokenizer_random_sampling: bool = True,
+        tokenizer_sample_ratio: float = 0.5,
     ):
         """準備分詞器"""
 
@@ -1136,30 +1172,73 @@ class TokenizerManager:
                 extra_chars_files=extra_chars_files,
             )
 
+            # 改進的採樣邏輯：隨機採樣而非順序切片
+            
+            total_input_samples = len(training_data)
             sample_cap = int(max_training_samples) if max_training_samples else 0
+            
+            # 決定採樣數量
             if sample_cap > 0:
-                training_subset = training_data[:sample_cap]
-                self.logger.info(f"分詞器訓練樣本上限: {sample_cap}（實際使用 {len(training_subset)} 筆）")
-            else:
-                training_subset = training_data
-                if len(training_subset) > 1_000_000:
+                # 明確指定上限
+                target_samples = min(sample_cap, total_input_samples)
+                self.logger.info(
+                    f"分詞器訓練樣本上限: {sample_cap}（數據集大小: {total_input_samples}，"
+                    f"將使用: {target_samples}）"
+                )
+            elif total_input_samples > 100_000:
+                # 自動降採樣：超過 10 萬自動應用比率採樣
+                if tokenizer_random_sampling and tokenizer_sample_ratio > 0:
+                    target_samples = max(10_000, int(total_input_samples * tokenizer_sample_ratio))
                     self.logger.warning(
-                        "分詞器訓練樣本超過 100 萬，可能耗時很長。"
+                        f"分詞器訓練數據大 ({total_input_samples})，啟用隨機採樣 "
+                        f"(比率: {tokenizer_sample_ratio*100:.1f}%) → {target_samples} 筆"
+                    )
+                else:
+                    target_samples = total_input_samples
+                    self.logger.warning(
+                        "分詞器訓練樣本超過 10 萬，可能耗時很長或導致 OOM。"
                         "可使用 --tokenizer_train_max_samples 限制樣本數以提速。"
                     )
+            else:
+                target_samples = total_input_samples
+            
+            # 進行隨機採樣
+            if target_samples < total_input_samples and tokenizer_random_sampling:
+                # 隨機打亂索引並取前 N 筆（等同於隨機採樣）
+                indices = list(range(total_input_samples))
+                random.seed(42)  # 使用固定種子以保證可復現性
+                random.shuffle(indices)
+                selected_indices = sorted(indices[:target_samples])
+                training_subset = [training_data[i] for i in selected_indices]
+                self.logger.info(
+                    f"已從 {total_input_samples} 筆隨機採樣 {target_samples} 筆 "
+                    f"(佔 {target_samples/total_input_samples*100:.1f}%) 用於分詞器訓練"
+                )
+            else:
+                training_subset = training_data
+                self.logger.info(f"使用全部 {target_samples} 筆數據訓練分詞器")
 
+            # 統計有效樣本
             valid_sample_count = 0
+            invalid_count = 0
             for item in tqdm(training_subset, desc="統計分詞樣本"):
                 if not isinstance(item, dict):
+                    invalid_count += 1
                     continue
                 instruction, input_text, output = _extract_supervised_fields(item)
                 if instruction and output:
                     valid_sample_count += 1
+                else:
+                    invalid_count += 1
 
             if valid_sample_count <= 0:
                 raise ValueError("沒有收集到用於訓練分詞器的文本")
 
             total_texts = valid_sample_count * 2
+            self.logger.info(
+                f"分詞樣本統計: 有效 {valid_sample_count}, 無效 {invalid_count}, "
+                f"總文本數: {total_texts}"
+            )
 
             def text_iterator():
                 for item in training_subset:

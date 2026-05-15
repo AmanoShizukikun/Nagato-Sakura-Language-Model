@@ -132,8 +132,16 @@ const refs = {
     newChatBtn: document.getElementById("newChatBtn"),
     tempChatBtn: document.getElementById("tempChatBtn"),
     openSettingsBtn: document.getElementById("openSettingsBtn"),
+    voiceCallBtn: document.getElementById("voiceCallBtn"),
+    videoCallBtn: document.getElementById("videoCallBtn"),
     settingsModal: document.getElementById("settingsModal"),
     closeSettingsBtn: document.getElementById("closeSettingsBtn"),
+    callBackdrop: document.getElementById("callBackdrop"),
+    videoCallModal: document.getElementById("videoCallModal"),
+    closeVideoCallBtn: document.getElementById("closeVideoCallBtn"),
+    callModeButtons: Array.from(document.querySelectorAll(".call-mode-btn")),
+    live2dCallHost: document.getElementById("live2dCallHost"),
+    model3dCallHost: document.getElementById("model3dCallHost"),
     settingsNav: document.getElementById("settingsNav"),
     saveSettingsBtn: document.getElementById("saveSettingsBtn"),
     resetSettingsBtn: document.getElementById("resetSettingsBtn"),
@@ -191,6 +199,7 @@ const refs = {
     displayDensity: document.getElementById("displayDensity"),
     displayAnimations: document.getElementById("displayAnimations"),
     displayMarkdown: document.getElementById("displayMarkdown"),
+    displayLowPowerMode: document.getElementById("displayLowPowerMode"),
     displayMetaTokensPerSec: document.getElementById("displayMetaTokensPerSec"),
     displayMetaTokens: document.getElementById("displayMetaTokens"),
     displayMetaElapsed: document.getElementById("displayMetaElapsed"),
@@ -352,6 +361,7 @@ function getDefaultSettings() {
             chatUiMode: pickString(uiDefaults.chatUiMode, "bubbleOnly", CHAT_UI_MODES),
             displayDensity: pickString(uiDefaults.displayDensity, "normal", ["compact", "normal", "relaxed"]),
             displayAnimations: boolValue(uiDefaults.displayAnimations, true),
+            lowPowerMode: boolValue(uiDefaults.lowPowerMode, false),
             displayMarkdown: boolValue(uiDefaults.displayMarkdown, true),
             metaShowTokensPerSec: boolValue(uiDefaults.metaShowTokensPerSec, true),
             metaShowTokens: boolValue(uiDefaults.metaShowTokens, true),
@@ -415,6 +425,7 @@ function sanitizeSettings(rawSettings) {
     normalized.uiState.chatUiMode = pickString(uiState.chatUiMode, defaults.uiState.chatUiMode, CHAT_UI_MODES);
     normalized.uiState.displayDensity = pickString(uiState.displayDensity, defaults.uiState.displayDensity, ["compact", "normal", "relaxed"]);
     normalized.uiState.displayAnimations = boolValue(uiState.displayAnimations, defaults.uiState.displayAnimations);
+    normalized.uiState.lowPowerMode = boolValue(uiState.lowPowerMode, defaults.uiState.lowPowerMode);
     normalized.uiState.displayMarkdown = boolValue(uiState.displayMarkdown, defaults.uiState.displayMarkdown);
     normalized.uiState.metaShowTokensPerSec = boolValue(uiState.metaShowTokensPerSec, defaults.uiState.metaShowTokensPerSec);
     normalized.uiState.metaShowTokens = boolValue(uiState.metaShowTokens, defaults.uiState.metaShowTokens);
@@ -522,6 +533,12 @@ function applyDisplayState(uiState) {
     document.body.setAttribute("data-chat-ui", pickString(uiState.chatUiMode, "bubbleOnly", CHAT_UI_MODES));
     document.body.setAttribute("data-density", uiState.displayDensity || "normal");
     document.body.classList.toggle("reduced-motion", !uiState.displayAnimations);
+    // Low power mode: disable heavy visuals and stop continuous audio monitoring
+    const enabled = Boolean(uiState.lowPowerMode);
+    document.body.classList.toggle("low-power", enabled);
+    if (enabled) {
+        try { stopMicMonitor(); } catch (e) { /* ignore */ }
+    }
 }
 
 function applyProfileSettingsToControls() {
@@ -664,6 +681,9 @@ function applySettingsToUI() {
     if (refs.displayMarkdown) {
         refs.displayMarkdown.checked = Boolean(state.settings.uiState.displayMarkdown);
     }
+    if (refs.displayLowPowerMode) {
+        refs.displayLowPowerMode.checked = Boolean(state.settings.uiState.lowPowerMode);
+    }
     if (refs.displayMetaTokensPerSec) {
         refs.displayMetaTokensPerSec.checked = Boolean(state.settings.uiState.metaShowTokensPerSec);
     }
@@ -729,6 +749,7 @@ function syncSettingsFromUi() {
     state.settings.uiState.displayDensity = refs.displayDensity.value;
     state.settings.uiState.displayAnimations = Boolean(refs.displayAnimations.checked);
     state.settings.uiState.displayMarkdown = Boolean(refs.displayMarkdown ? refs.displayMarkdown.checked : state.settings.uiState.displayMarkdown);
+    state.settings.uiState.lowPowerMode = Boolean(refs.displayLowPowerMode ? refs.displayLowPowerMode.checked : state.settings.uiState.lowPowerMode);
     state.settings.uiState.metaShowTokensPerSec = Boolean(refs.displayMetaTokensPerSec ? refs.displayMetaTokensPerSec.checked : state.settings.uiState.metaShowTokensPerSec);
     state.settings.uiState.metaShowTokens = Boolean(refs.displayMetaTokens ? refs.displayMetaTokens.checked : state.settings.uiState.metaShowTokens);
     state.settings.uiState.metaShowElapsed = Boolean(refs.displayMetaElapsed ? refs.displayMetaElapsed.checked : state.settings.uiState.metaShowElapsed);
@@ -1688,6 +1709,730 @@ function closeSettings() {
     refs.settingsModal.setAttribute("aria-hidden", "true");
     refs.settingsBackdrop.classList.remove("show");
     stopAllMediaTests();
+}
+
+let live2dInitPromise = null;
+let activeCallMode = "live2d";
+let fbxInitPromise = null;
+let fbxViewerState = null;
+
+function updateCallModeButtons(mode) {
+    if (!refs.callModeButtons || refs.callModeButtons.length === 0) {
+        return;
+    }
+    refs.callModeButtons.forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.callMode === mode);
+    });
+}
+
+function mountLive2dInCall() {
+    const waifu = document.getElementById("waifu");
+    if (!waifu || !refs.live2dCallHost) {
+        return;
+    }
+    if (waifu.parentElement !== refs.live2dCallHost) {
+        refs.live2dCallHost.innerHTML = "";
+        refs.live2dCallHost.appendChild(waifu);
+    }
+    waifu.classList.remove("waifu-hidden");
+    waifu.classList.add("waifu-active");
+}
+
+function hideLive2dInCall() {
+    const waifu = document.getElementById("waifu");
+    if (waifu) {
+        waifu.classList.remove("waifu-hidden");
+    }
+}
+
+function waitForLive2dReady(timeoutMs = 6000) {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+            if (done) {
+                return;
+            }
+            done = true;
+            resolve();
+        };
+        const timer = window.setTimeout(finish, timeoutMs);
+        document.addEventListener("live2d:modelReady", () => {
+            window.clearTimeout(timer);
+            finish();
+        }, { once: true });
+    });
+}
+
+function loadScriptOnce(src, id) {
+    return new Promise((resolve, reject) => {
+        if (id && document.getElementById(id)) {
+            resolve();
+            return;
+        }
+        const s = document.createElement("script");
+        if (id) {
+            s.id = id;
+        }
+        s.src = src;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error(`Failed to load ${src}`));
+        document.head.appendChild(s);
+    });
+}
+
+function setModel3dPlaceholder(text) {
+    if (!refs.model3dCallHost) {
+        return;
+    }
+    const p = refs.model3dCallHost.querySelector(".model3d-placeholder p");
+    if (p) {
+        p.textContent = text;
+    }
+}
+
+async function ensureFbxViewerLibs() {
+    if (window.THREE && window.THREE.FBXLoader) {
+        return true;
+    }
+    if (!fbxInitPromise) {
+        fbxInitPromise = (async () => {
+            try {
+                const threeMod = await import("/static/3d/three.module.min.js");
+                const { FBXLoader } = await import("/static/3d/FBXLoader.js");
+                window.THREE = window.THREE || {};
+                Object.assign(window.THREE, threeMod);
+                window.THREE.FBXLoader = FBXLoader;
+                return true;
+            } catch (err) {
+                console.warn("FBX viewer libs not found", err);
+                return false;
+            }
+        })();
+    }
+    return await fbxInitPromise;
+}
+
+async function initModel3dViewer() {
+    console.log("[3D] initModel3dViewer called");
+    if (!refs.model3dCallHost) {
+        console.warn("[3D] model3dCallHost ref not found");
+        return;
+    }
+    if (fbxViewerState) {
+        console.log("[3D] fbxViewerState already exists, skipping init");
+        return;
+    }
+    const ok = await ensureFbxViewerLibs();
+    console.log("[3D] ensureFbxViewerLibs:", ok, "THREE:", !!window.THREE, "FBXLoader:", !!window.THREE?.FBXLoader);
+    if (!ok || !window.THREE || !window.THREE.FBXLoader) {
+        setModel3dPlaceholder("3D 模型載入失敗，請確認 /static/3d 下的檔案。");
+        return;
+    }
+
+    const canvas = document.getElementById("model3dCanvas");
+    if (!canvas) {
+        console.warn("[3D] model3dCanvas not found in DOM");
+        return;
+    }
+    /* Force canvas visible so WebGLRenderer gets a drawing buffer */
+    canvas.style.display = "block";
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+
+    refs.model3dCallHost.classList.remove("model3d-ready");
+    setModel3dPlaceholder("撥號中... 正在建立視訊連線");
+
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+    const renderer = new window.THREE.WebGLRenderer({
+        canvas,
+        alpha: true,
+        antialias: true,
+    });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    if (renderer.outputColorSpace !== undefined) {
+        renderer.outputColorSpace = window.THREE.SRGBColorSpace || "srgb";
+    }
+    console.log("[3D] WebGLRenderer created");
+    const scene = new window.THREE.Scene();
+    scene.background = new window.THREE.Color(0x0a0b14);
+    const camera = new window.THREE.PerspectiveCamera(30, 1, 0.1, 1000);
+    camera.position.set(0, 1.2, 4.5);
+    camera.lookAt(0, 1, 0);
+
+    const state = {
+        target: new window.THREE.Vector3(0, 1, 0),
+        radius: 4.5,
+        targetRadius: 4.5,
+        minRadius: 1.2,
+        maxRadius: 12,
+        yaw: 0,
+        pitch: 0.12,
+        targetYaw: 0,
+        targetPitch: 0.12,
+        isDragging: false,
+        isPanning: false,
+        lastX: 0,
+        lastY: 0,
+        mixer: null,
+        root: null,
+        autoRotate: false,
+        needsResize: true,
+        defaultTarget: new window.THREE.Vector3(0, 1, 0),
+        defaultRadius: 4.5
+    };
+
+    const clock = new window.THREE.Clock();
+    const modelGroup = new window.THREE.Group();
+    scene.add(modelGroup);
+    let gridHelper = null;
+    let gridVisible = false;
+    let originalMaterials = new Map();
+    let currentRenderMode = "shadeless";
+    const lights = [];
+
+    function syncCamera() {
+        const pitch = clamp(state.pitch, -1.2, 1.2);
+        const radius = clamp(state.radius, state.minRadius, state.maxRadius);
+        const phi = Math.PI / 2 - pitch;
+        const theta = state.yaw;
+        const sinPhi = Math.sin(phi);
+        camera.position.set(
+            state.target.x + radius * sinPhi * Math.cos(theta),
+            state.target.y + radius * Math.cos(phi),
+            state.target.z + radius * sinPhi * Math.sin(theta)
+        );
+        camera.lookAt(state.target);
+    }
+
+    function onPointerDown(event) {
+        if (event.button === 2 || (event.button === 0 && event.shiftKey)) {
+            state.isPanning = true;
+        } else {
+            state.isDragging = true;
+        }
+        state.lastX = event.clientX;
+        state.lastY = event.clientY;
+        canvas.setPointerCapture?.(event.pointerId);
+    }
+
+    function onPointerMove(event) {
+        if (!state.isDragging && !state.isPanning) return;
+        const dx = event.clientX - state.lastX;
+        const dy = event.clientY - state.lastY;
+        state.lastX = event.clientX;
+        state.lastY = event.clientY;
+
+        if (state.isDragging) {
+            const rotateSpeed = 0.005;
+            state.targetYaw += dx * rotateSpeed;
+            state.targetPitch = clamp(state.targetPitch + dy * rotateSpeed, -1.2, 1.2);
+        } else if (state.isPanning) {
+            const panSpeed = state.radius * 0.002;
+            const theta = state.yaw;
+            const phi = Math.PI / 2 - state.pitch;
+            
+            const rx = Math.sin(theta);
+            const rz = -Math.cos(theta);
+            
+            const ux = -Math.cos(phi) * Math.cos(theta);
+            const uy = Math.sin(phi);
+            const uz = -Math.cos(phi) * Math.sin(theta);
+            
+            state.target.x += (-rx * dx + ux * dy) * panSpeed;
+            state.target.y += (uy * dy) * panSpeed;
+            state.target.z += (-rz * dx + uz * dy) * panSpeed;
+        }
+    }
+
+    function onPointerUp(event) {
+        state.isDragging = false;
+        state.isPanning = false;
+        canvas.releasePointerCapture?.(event.pointerId);
+    }
+
+    function onWheel(event) {
+        event.preventDefault();
+        const zoomFactor = Math.exp(event.deltaY * 0.0015);
+        state.targetRadius = clamp(state.targetRadius * zoomFactor, state.minRadius, state.maxRadius);
+    }
+
+    function resetView() {
+        state.target.copy(state.defaultTarget);
+        state.targetYaw = 0;
+        state.targetPitch = 0.12;
+        state.targetRadius = state.defaultRadius;
+    }
+
+    function onDoubleClick() {
+        resetView();
+    }
+
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
+    canvas.addEventListener("pointerleave", onPointerUp);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("dblclick", onDoubleClick);
+    canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+    /* Lights (initially hidden for Shadeless default) */
+    const ambLight = new window.THREE.AmbientLight(0xffffff, 0.6);
+    const hemi = new window.THREE.HemisphereLight(0xffffff, 0x223344, 1.0);
+    const dir = new window.THREE.DirectionalLight(0xffffff, 1.2);
+    dir.position.set(3, 5, 2);
+    const dir2 = new window.THREE.DirectionalLight(0xaaccff, 0.5);
+    dir2.position.set(-3, 3, -2);
+    lights.push(ambLight, hemi, dir, dir2);
+    /* Don't add lights to scene yet — Shadeless is default */
+    console.log("[3D] Scene + lights ready (Shadeless default)");
+
+    /* ---- Render Mode functions ---- */
+    function storeOriginalMaterials(root) {
+        root.traverse((child) => {
+            if (child.isMesh && child.material) {
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+                originalMaterials.set(child.uuid, mats.map(m => m.clone()));
+            }
+        });
+    }
+
+    function applyRenderMode(mode) {
+        if (!state.root) return;
+        currentRenderMode = mode;
+        /* Remove/add lights based on mode */
+        lights.forEach(l => scene.remove(l));
+        if (mode === "glsl") {
+            lights.forEach(l => scene.add(l));
+        }
+
+        state.root.traverse((child) => {
+            if (!child.isMesh) return;
+            const stored = originalMaterials.get(child.uuid);
+            if (!stored) return;
+
+            if (mode === "shadeless") {
+                /* Unlit: MeshBasicMaterial preserving textures */
+                const newMats = stored.map(m => {
+                    const basic = new window.THREE.MeshBasicMaterial({
+                        map: m.map || null,
+                        // Force color to be brighter (1.1 multiplier) instead of relying on potentially dark original material colors
+                        color: new window.THREE.Color(1.1, 1.1, 1.1),
+                        side: window.THREE.DoubleSide,
+                        transparent: m.transparent || false,
+                        opacity: m.opacity !== undefined ? m.opacity : 1,
+                        alphaMap: m.alphaMap || null,
+                        skinning: true,
+                    });
+                    return basic;
+                });
+                child.material = newMats.length === 1 ? newMats[0] : newMats;
+            } else if (mode === "glsl") {
+                /* Standard lit: restore original Phong/Lambert materials */
+                const restored = stored.map(m => {
+                    const c = m.clone();
+                    c.side = window.THREE.DoubleSide;
+                    c.needsUpdate = true;
+                    return c;
+                });
+                child.material = restored.length === 1 ? restored[0] : restored;
+            } else if (mode === "holo") {
+                /* Holographic: texture + scanline + rim lighting */
+                const newMats = stored.map(m => {
+                    const hasMap = !!m.map;
+                    const holoMat = new window.THREE.ShaderMaterial({
+                        uniforms: {
+                            time: { value: 0 },
+                            holoColor: { value: new window.THREE.Color(0x00d4ff) },
+                            tDiffuse: { value: m.map || null },
+                            hasTexture: { value: hasMap ? 1.0 : 0.0 }
+                        },
+                        vertexShader: `
+                            varying vec3 vNormal;
+                            varying vec3 vPosition;
+                            varying vec2 vUv;
+                            void main() {
+                                vUv = uv;
+                                vNormal = normalize(normalMatrix * normal);
+                                vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
+                                gl_Position = projectionMatrix * vec4(vPosition, 1.0);
+                            }
+                        `,
+                        fragmentShader: `
+                            uniform float time;
+                            uniform vec3 holoColor;
+                            uniform sampler2D tDiffuse;
+                            uniform float hasTexture;
+                            
+                            varying vec3 vNormal;
+                            varying vec3 vPosition;
+                            varying vec2 vUv;
+                            
+                            void main() {
+                                vec3 viewDir = normalize(-vPosition);
+                                float rim = 1.0 - max(dot(viewDir, vNormal), 0.0);
+                                rim = smoothstep(0.4, 1.0, rim);
+                                
+                                // Single scanline moving upwards slowly, with a thinner and sharper glow
+                                float scanPhase = fract(vPosition.y * 0.4 - time * 0.15);
+                                float scanline = smoothstep(0.96, 1.0, scanPhase);
+                                scanline += smoothstep(0.85, 0.96, scanPhase) * 0.3;
+                                
+                                vec4 texColor = vec4(1.0);
+                                if (hasTexture > 0.5) {
+                                    texColor = texture2D(tDiffuse, vUv);
+                                }
+                                
+                                vec3 baseColor = mix(texColor.rgb, holoColor, 0.45);
+                                // Stronger scanline glow (multiplied by 2.5)
+                                vec3 finalColor = baseColor + (holoColor * rim * 0.8) + (holoColor * scanline * 2.5);
+                                
+                                // Decreased base opacity to 0.25 for higher transparency
+                                float alpha = texColor.a * (0.25 + rim * 0.4 + scanline * 0.8);
+                                alpha = min(alpha, 1.0); // Clamp to max 1.0
+                                
+                                float pulse = sin(time * 2.0) * 0.05 + 0.95;
+                                
+                                gl_FragColor = vec4(finalColor * pulse, alpha);
+                            }
+                        `,
+                        transparent: true,
+                        side: window.THREE.DoubleSide,
+                        depthWrite: false,
+                        blending: window.THREE.AdditiveBlending,
+                        skinning: true
+                    });
+                    return holoMat;
+                });
+                child.userData.holoMats = newMats;
+                child.material = newMats.length === 1 ? newMats[0] : newMats;
+            }
+        });
+
+        /* Update toolbar button states */
+        refs.model3dCallHost.querySelectorAll(".m3d-btn[data-render-mode]").forEach(btn => {
+            btn.classList.toggle("active", btn.dataset.renderMode === mode);
+        });
+    }
+
+    function toggleGrid() {
+        gridVisible = !gridVisible;
+        if (gridHelper) gridHelper.visible = gridVisible;
+        const btn = document.getElementById("gridToggleBtn");
+        if (btn) btn.classList.toggle("active", gridVisible);
+    }
+
+    /* Wire up control buttons */
+    refs.model3dCallHost.querySelectorAll(".m3d-btn[data-render-mode]").forEach(btn => {
+        btn.addEventListener("click", () => applyRenderMode(btn.dataset.renderMode));
+    });
+    const gridBtn = document.getElementById("gridToggleBtn");
+    if (gridBtn) gridBtn.addEventListener("click", toggleGrid);
+    
+    const resetBtn = document.getElementById("m3dResetBtn");
+    if (resetBtn) resetBtn.addEventListener("click", resetView);
+    
+    const animSelect = document.getElementById("m3dAnimSelect");
+    if (animSelect) {
+        animSelect.addEventListener("change", (e) => {
+            if (!state.mixer || !state.root || !state.root.animations) return;
+            const clipName = e.target.value;
+            const clip = state.root.animations.find(c => c.name === clipName);
+            if (clip) {
+                state.mixer.stopAllAction();
+                state.mixer.clipAction(clip).play();
+                console.log("[3D] Playing animation:", clipName);
+            }
+        });
+    }
+
+    console.log("[3D] Starting FBX load");
+    const loader = new window.THREE.FBXLoader();
+    loader.load(
+        "/static/3d/ns.fbx",
+        (obj) => {
+            try {
+                console.log("[3D] FBX onLoad fired, type:", obj.type, "children:", obj.children?.length, "anims:", obj.animations?.length);
+                if (state.root) { modelGroup.remove(state.root); }
+
+                /* Compute raw bounding box first (no scale) */
+                obj.updateMatrixWorld(true);
+                const rawBox = new window.THREE.Box3().setFromObject(obj);
+                const rawSize = new window.THREE.Vector3();
+                const rawCenter = new window.THREE.Vector3();
+                rawBox.getSize(rawSize);
+                rawBox.getCenter(rawCenter);
+                const rawMaxDim = Math.max(rawSize.x, rawSize.y, rawSize.z);
+                console.log("[3D] Raw model size:", rawSize.x.toFixed(2), rawSize.y.toFixed(2), rawSize.z.toFixed(2), "maxDim:", rawMaxDim.toFixed(2));
+
+                /* Auto-scale: normalize so largest dimension is ~2 units */
+                const targetSize = 2.0;
+                const autoScale = rawMaxDim > 0 ? targetSize / rawMaxDim : 1;
+                obj.scale.setScalar(autoScale);
+                obj.updateMatrixWorld(true);
+                console.log("[3D] Auto-scale factor:", autoScale.toFixed(6));
+
+                /* Re-compute bounding box after scaling */
+                const box = new window.THREE.Box3().setFromObject(obj);
+                const size = new window.THREE.Vector3();
+                const center = new window.THREE.Vector3();
+                box.getSize(size);
+                box.getCenter(center);
+                console.log("[3D] Scaled size:", size.x.toFixed(2), size.y.toFixed(2), size.z.toFixed(2), "center:", center.x.toFixed(2), center.y.toFixed(2), center.z.toFixed(2));
+
+                if (size.x === 0 && size.y === 0 && size.z === 0) {
+                    console.warn("[3D] Zero bounding box, adding model as-is");
+                    modelGroup.add(obj);
+                    state.root = obj;
+                } else {
+                    obj.position.sub(center);
+                    obj.position.y -= size.y * 0.45;
+                    modelGroup.add(obj);
+                    state.root = obj;
+
+                    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+                    state.minRadius = Math.max(0.6, maxDim * 0.5);
+                    state.maxRadius = Math.max(3.5, maxDim * 6);
+                    state.radius = Math.max(state.minRadius, maxDim * 1.8); //模型初始大小
+                    state.targetRadius = state.radius;
+                    state.target.set(0, -0.7, 0); //模型初始位置
+                    state.defaultTarget.copy(state.target);
+                    state.defaultRadius = state.radius;
+
+                    camera.near = Math.max(0.01, maxDim / 200);
+                    camera.far = Math.max(40, maxDim * 20);
+                    camera.updateProjectionMatrix();
+                    console.log("[3D] Camera near:", camera.near, "far:", camera.far, "radius:", state.radius);
+
+                    /* Create grid at the model's feet */
+                    try {
+                        const gSize = Math.max(4, maxDim * 3);
+                        gridHelper = new window.THREE.GridHelper(gSize, 20, 0x5566aa, 0x334466);
+                        /* foot position = -(size.y * 0.95) because we moved center to 0 then shifted down by 0.45*sizeY */
+                        gridHelper.position.y = -(size.y * 0.95);
+                        gridHelper.visible = gridVisible;
+                        scene.add(gridHelper);
+                        console.log("[3D] Grid created at y =", gridHelper.position.y.toFixed(2));
+                    } catch(gErr) {
+                        console.warn("[3D] Grid creation failed:", gErr);
+                    }
+                }
+
+                /* Force all materials to DoubleSide, disable frustum culling */
+                let meshCount = 0;
+                obj.traverse((child) => {
+                    if (child.isMesh) {
+                        meshCount++;
+                        child.frustumCulled = false;
+                        if (child.material) {
+                            const mats = Array.isArray(child.material) ? child.material : [child.material];
+                            mats.forEach((m) => {
+                                m.side = window.THREE.DoubleSide;
+                                m.transparent = m.transparent || false;
+                                m.needsUpdate = true;
+                            });
+                        }
+                    }
+                });
+                console.log("[3D] Total meshes found:", meshCount);
+
+                /* Store original materials for render mode switching */
+                storeOriginalMaterials(obj);
+
+                if (obj.animations && obj.animations.length > 0) {
+                    state.mixer = new window.THREE.AnimationMixer(obj);
+                    state.mixer.clipAction(obj.animations[0]).play();
+                    console.log("[3D] AnimationMixer created, playing clip 0");
+                    
+                    if (animSelect) {
+                        animSelect.innerHTML = "";
+                        obj.animations.forEach(clip => {
+                            const opt = document.createElement("option");
+                            opt.value = clip.name;
+                            opt.textContent = clip.name || "Unnamed Animation";
+                            animSelect.appendChild(opt);
+                        });
+                        animSelect.value = obj.animations[0].name;
+                        animSelect.disabled = false;
+                    }
+                } else if (animSelect) {
+                    animSelect.innerHTML = '<option value="">無動作</option>';
+                    animSelect.disabled = true;
+                }
+
+                syncCamera();
+                refs.model3dCallHost.classList.add("model3d-ready");
+                state.needsResize = true;
+                resize();
+
+                /* Apply default Shadeless render mode */
+                applyRenderMode("shadeless");
+                console.log("[3D] Model loaded, model3d-ready set");
+            } catch (loadErr) {
+                console.error("[3D] Error in FBX onLoad:", loadErr);
+                setModel3dPlaceholder("FBX 處理失敗: " + loadErr.message);
+            }
+        },
+        (progress) => {
+            if (progress.total > 0) {
+                setModel3dPlaceholder("撥號中... 正在建立視訊連線");
+            }
+        },
+        (err) => {
+            console.error("[3D] Failed to load ns.fbx:", err);
+            setModel3dPlaceholder("3D 模型載入失敗: " + (err?.message || err));
+            refs.model3dCallHost.classList.remove("model3d-ready");
+        }
+    );
+
+    function resize() {
+        const rect = refs.model3dCallHost.getBoundingClientRect();
+        const w = Math.max(1, rect.width);
+        const h = Math.max(1, rect.height);
+        if (w > 1 && h > 1) {
+            renderer.setSize(w, h, false);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            state.needsResize = false;
+        }
+    }
+
+    let _fc = 0;
+    let holoTime = 0;
+    function animate() {
+        const delta = Math.min(clock.getDelta(), 0.05);
+        if (document.body.classList.contains("video-call-open") && activeCallMode === "model3d") {
+            if (state.needsResize) {
+                resize();
+            }
+            if (state.autoRotate && !state.isDragging) {
+                state.targetYaw += delta * 0.25;
+            }
+            state.yaw += (state.targetYaw - state.yaw) * 0.12;
+            state.pitch += (state.targetPitch - state.pitch) * 0.12;
+            state.radius += (state.targetRadius - state.radius) * 0.12;
+            state.pitch = clamp(state.pitch, -1.2, 1.2);
+            state.radius = clamp(state.radius, state.minRadius, state.maxRadius);
+            syncCamera();
+            if (state.mixer) {
+                state.mixer.update(delta);
+            }
+            /* Holographic pulse animation */
+            if (currentRenderMode === "holo" && state.root) {
+                holoTime += delta;
+                state.root.traverse((child) => {
+                    if (child.isMesh && child.userData.holoMats) {
+                        child.userData.holoMats.forEach(m => {
+                            if (m.uniforms) m.uniforms.time.value = holoTime;
+                        });
+                    }
+                });
+            }
+            renderer.render(scene, camera);
+        }
+        requestAnimationFrame(animate);
+    }
+
+    resize();
+    window.addEventListener("resize", () => { state.needsResize = true; resize(); });
+    animate();
+    console.log("[3D] Animation loop started");
+
+    fbxViewerState = { renderer, scene, camera, state, resize };
+}
+
+async function ensureLive2dForCall() {
+    if (!refs.live2dCallHost) {
+        return;
+    }
+    if (!live2dInitPromise) {
+        live2dInitPromise = (async () => {
+            try {
+                if (!document.querySelector('link[data-live2d-call="true"]')) {
+                    const l = document.createElement("link");
+                    l.rel = "stylesheet";
+                    l.href = "/static/live2d/live2d.css";
+                    l.dataset.live2dCall = "true";
+                    document.head.appendChild(l);
+                }
+
+                await import("/static/live2d/waifu-tips.js");
+                if (typeof window.initWidget === "function") {
+                    window.initWidget({
+                        waifuPath: "/static/live2d/waifu-config-webui.json",
+                        cubism2Path: "/static/live2d/live2d.min.js",
+                        cubism5Path: "/static/live2d/live2dcubismcore.min.js",
+                        tools: [],
+                        drag: false,
+                        logLevel: "warn",
+                        modelId: 0
+                    });
+                    document.getElementById("waifu-toggle")?.remove();
+                    await waitForLive2dReady();
+                } else if (refs.live2dCallHost) {
+                    refs.live2dCallHost.innerHTML = '<div class="model3d-placeholder"><p>Live2D initialization failed: initWidget not found.</p></div>';
+                }
+            } catch (err) {
+                console.warn("Live2D init failed", err);
+                if (refs.live2dCallHost) {
+                    refs.live2dCallHost.innerHTML = '<div class="model3d-placeholder"><p>Live2D assets missing or failed to load.</p></div>';
+                }
+            }
+        })();
+    }
+    await live2dInitPromise;
+    mountLive2dInCall();
+}
+
+function setCallMode(mode) {
+    activeCallMode = mode;
+    if (refs.live2dCallHost) {
+        refs.live2dCallHost.classList.toggle("active", mode === "live2d");
+    }
+    if (refs.model3dCallHost) {
+        refs.model3dCallHost.classList.toggle("active", mode === "model3d");
+    }
+    updateCallModeButtons(mode);
+    if (mode === "live2d") {
+        ensureLive2dForCall().then(() => {
+            window.dispatchEvent(new Event("resize"));
+        });
+    } else {
+        hideLive2dInCall();
+        void initModel3dViewer();
+        if (fbxViewerState) {
+            fbxViewerState.state.needsResize = true;
+            requestAnimationFrame(() => fbxViewerState?.resize?.());
+        }
+    }
+}
+
+function openVideoCallModal(mode = "live2d") {
+    if (!refs.videoCallModal || !refs.callBackdrop) {
+        return;
+    }
+    refs.videoCallModal.classList.add("open");
+    refs.videoCallModal.setAttribute("aria-hidden", "false");
+    refs.callBackdrop.classList.add("show");
+    document.body.classList.add("video-call-open");
+    document.body.style.overflow = "hidden";
+    setCallMode(mode);
+    if (mode !== "model3d") {
+        void initModel3dViewer();
+    }
+}
+
+function closeVideoCallModal() {
+    if (!refs.videoCallModal || !refs.callBackdrop) {
+        return;
+    }
+    refs.videoCallModal.classList.remove("open");
+    refs.videoCallModal.setAttribute("aria-hidden", "true");
+    refs.callBackdrop.classList.remove("show");
+    document.body.classList.remove("video-call-open");
+    document.body.style.overflow = "";
+    hideLive2dInCall();
 }
 
 function getConversationPreview(conv) {
@@ -2833,12 +3578,56 @@ function updateJumpToLatestAnchor() {
 
 function bindEvents() {
     refs.closeSidebarBtn.addEventListener("click", () => {
-        toggleSidebar();
+        // On wide screens keep original collapse behavior; on narrow/mobile close the off-canvas drawer
+        if (window.innerWidth > 900) {
+            toggleSidebar();
+        } else {
+            // close left drawer if open
+            refs.appShell.classList.remove('drawer-left-open');
+            const db = document.getElementById('drawerBackdrop');
+            if (db) db.classList.remove('show');
+            document.body.style.overflow = '';
+        }
     });
 
     if (refs.roleInfoBtn) {
         refs.roleInfoBtn.addEventListener("click", () => {
-            refs.appShell.classList.toggle("right-sidebar-expanded");
+            if (window.innerWidth > 900) {
+                refs.appShell.classList.toggle("right-sidebar-expanded");
+            } else {
+                // On mobile/tight layouts, open off-canvas right drawer instead
+                refs.appShell.classList.add('drawer-right-open');
+                const db = document.getElementById('drawerBackdrop');
+                if (db) db.classList.add('show');
+                document.body.style.overflow = 'hidden';
+            }
+        });
+    }
+
+    if (refs.videoCallBtn) {
+        refs.videoCallBtn.addEventListener("click", () => {
+            openVideoCallModal("live2d");
+        });
+    }
+
+    if (refs.closeVideoCallBtn) {
+        refs.closeVideoCallBtn.addEventListener("click", () => {
+            closeVideoCallModal();
+        });
+    }
+
+    if (refs.callBackdrop) {
+        refs.callBackdrop.addEventListener("click", () => {
+            closeVideoCallModal();
+        });
+    }
+
+    if (refs.callModeButtons && refs.callModeButtons.length) {
+        refs.callModeButtons.forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const mode = btn.dataset.callMode || "live2d";
+                setCallMode(mode);
+            });
         });
     }
 
@@ -3397,6 +4186,10 @@ function bindEvents() {
     document.addEventListener("keydown", (event) => {
         const escapeEnabled = !state.settings || state.settings.uiState.shortcutEscClosePanels !== false;
         if (event.key === "Escape" && escapeEnabled) {
+            if (refs.videoCallModal && refs.videoCallModal.classList.contains("open")) {
+                closeVideoCallModal();
+                return;
+            }
             if (refs.settingsModal.classList.contains("open")) {
                 closeSettings();
                 return;
@@ -3447,3 +4240,66 @@ function init() {
 }
 
 init();
+
+// Low-power mode quick binding: update setting immediately when user toggles the checkbox
+(function () {
+    const el = document.getElementById("displayLowPowerMode");
+    if (!el) {
+        return;
+    }
+
+    el.addEventListener("change", (ev) => {
+        if (!state.settings) {
+            state.settings = getDefaultSettings();
+        }
+        state.settings.uiState.lowPowerMode = Boolean(ev.target.checked);
+        persistSettingsToStorage();
+        try { applyDisplayState(state.settings.uiState); } catch (e) { /* ignore */ }
+    });
+})();
+
+/* Mobile drawer (off-canvas) interactions */
+(function () {
+    function qs(id) { return document.getElementById(id); }
+    document.addEventListener('DOMContentLoaded', function () {
+        const appShell = document.querySelector('.app-shell');
+        const leftBtn = qs('mobileOpenLeftBtn');
+        const rightBtn = qs('mobileOpenRightBtn') || qs('roleInfoBtn');
+        const drawerBackdrop = qs('drawerBackdrop');
+        const closeLeftBtn = qs('closeSidebarBtn');
+        const closeRightBtn = qs('closeRightSidebarBtn');
+
+        function openLeft() {
+            appShell && appShell.classList.add('drawer-left-open');
+            drawerBackdrop && drawerBackdrop.classList.add('show');
+            document.body.style.overflow = 'hidden';
+        }
+        function closeLeft() {
+            appShell && appShell.classList.remove('drawer-left-open');
+            drawerBackdrop && drawerBackdrop.classList.remove('show');
+            document.body.style.overflow = '';
+        }
+        function openRight() {
+            appShell && appShell.classList.add('drawer-right-open');
+            drawerBackdrop && drawerBackdrop.classList.add('show');
+            document.body.style.overflow = 'hidden';
+        }
+        function closeRight() {
+            appShell && appShell.classList.remove('drawer-right-open');
+            drawerBackdrop && drawerBackdrop.classList.remove('show');
+            document.body.style.overflow = '';
+        }
+
+        if (leftBtn) leftBtn.addEventListener('click', openLeft);
+        // If rightBtn is the original roleInfoBtn, avoid double-binding here — bind only when it's the dedicated mobile button
+        if (rightBtn && rightBtn.id !== 'roleInfoBtn') rightBtn.addEventListener('click', openRight);
+        if (drawerBackdrop) drawerBackdrop.addEventListener('click', function () { closeLeft(); closeRight(); });
+        if (closeLeftBtn) closeLeftBtn.addEventListener('click', closeLeft);
+        if (closeRightBtn) closeRightBtn.addEventListener('click', closeRight);
+
+        // Close drawers with Escape
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') { closeLeft(); closeRight(); }
+        });
+    });
+})();

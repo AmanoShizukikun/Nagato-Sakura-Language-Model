@@ -4,13 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>長門櫻 Flask Web UI</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='flask-chat.css', v='20260424b34') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='flask-chat.css', v='20260509a22') }}">
 </head>
 <body>
     <div class="cyber-bg" aria-hidden="true"></div>
     <div class="grid-overlay" aria-hidden="true"></div>
     <div class="grain-overlay" aria-hidden="true"></div>
     <div class="settings-backdrop" id="settingsBackdrop" aria-hidden="true"></div>
+    <div class="drawer-backdrop" id="drawerBackdrop" aria-hidden="true"></div>
+    <div class="call-backdrop" id="callBackdrop" aria-hidden="true"></div>
 
     <div class="app-shell">
         <aside class="left-sidebar" id="leftSidebar" aria-label="對話側欄">
@@ -64,6 +66,9 @@
         <main class="chat-stage">
             <header class="topbar">
                 <div class="topbar-left">
+                    <button type="button" id="mobileOpenLeftBtn" class="discord-icon-btn mobile-toggle" aria-label="開啟側欄" title="開啟側欄">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg>
+                    </button>
                     <div class="brand">
                         <div class="brand-logo">
                             <img src="{{ url_for('static', filename='NS-V2.png') }}" alt="logo" width="100%">
@@ -179,6 +184,54 @@
                 <button type="button" id="viewFullProfileBtn" class="btn ghost" style="width: 100%;">檢視完整資料</button>
             </div>
         </aside>
+    </div>
+
+    <div class="call-modal" id="videoCallModal" aria-hidden="true">
+        <section class="call-panel" aria-label="視訊通話">
+            <div class="call-head">
+                <div>
+                    <h2>視訊通話</h2>
+                    <p>Live2D / 3D 模型顯示</p>
+                </div>
+                <div class="call-head-actions">
+                    <button type="button" class="call-mode-btn active" data-call-mode="live2d">Live2D</button>
+                    <button type="button" class="call-mode-btn" data-call-mode="model3d">3D</button>
+                    <button type="button" id="closeVideoCallBtn" class="icon-btn" aria-label="關閉視訊通話">×</button>
+                </div>
+            </div>
+            <div class="call-body">
+                <div class="call-stage">
+                    <div id="live2dCallHost" class="call-canvas active" aria-label="Live2D 顯示區"></div>
+                    <div id="model3dCallHost" class="call-canvas" aria-label="3D 顯示區">
+                        <canvas id="model3dCanvas" class="model3d-canvas" aria-hidden="true"></canvas>
+                        <div class="model3d-controls">
+                            <button type="button" class="m3d-btn active" data-render-mode="shadeless" title="無光照">Shadeless</button>
+                            <button type="button" class="m3d-btn" data-render-mode="glsl" title="GLSL 光照">GLSL</button>
+                            <button type="button" class="m3d-btn" data-render-mode="holo" title="全息投影">Holo</button>
+                            <span class="m3d-sep"></span>
+                            <button type="button" class="m3d-btn" id="gridToggleBtn" title="網格開關">Grid</button>
+                            <button type="button" class="m3d-btn" id="m3dResetBtn" title="重設相機位置">Reset</button>
+                            <span class="m3d-sep"></span>
+                            <select id="m3dAnimSelect" class="m3d-select" title="選擇動作" disabled>
+                                <option value="">無動作</option>
+                            </select>
+                        </div>
+                        <div class="model3d-placeholder">
+                            <div class="call-loader" aria-hidden="true">
+                                <div class="call-ring"></div>
+                                <div class="call-dots">
+                                    <span></span>
+                                    <span></span>
+                                    <span></span>
+                                </div>
+                            </div>
+                            <p>撥號中... 正在建立視訊連線</p>
+                            <span class="call-hint">3D 模型於背景準備中</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
     </div>
 
     <div class="settings-modal" id="settingsModal" aria-hidden="true">
@@ -346,7 +399,12 @@
                         <div class="toggle-grid settings-toggle-stack">
                             <label class="toggle-item"><input id="displayAnimations" type="checkbox" class="switch" checked><span>啟用介面動畫</span></label>
                             <label class="toggle-item"><input id="displayMarkdown" type="checkbox" class="switch" checked><span>啟用 Markdown 渲染</span></label>
+                            <label class="toggle-item"><input id="displayLowPowerMode" type="checkbox" class="switch"><span>低效能模式 (節能)</span></label>
                         </div>
+                        <div class="settings-block">
+                            <small class="field-hint">啟用後會關閉背景動畫、濾鏡、並停用自動麥克風監測以降低顯示卡與 CPU 使用。</small>
+                        </div>
+                        
 
                         <div class="settings-block">
                             <h3>訊息 Meta 顯示欄位</h3>
@@ -441,6 +499,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <script id="bootstrap-data" type="application/json">{{ bootstrap | tojson }}</script>
-    <script src="{{ url_for('static', filename='flask-chat.js', v='20260424b31') }}"></script>
+    <script src="{{ url_for('static', filename='flask-chat.js', v='20260509a22') }}"></script>
 </body>
 </html>

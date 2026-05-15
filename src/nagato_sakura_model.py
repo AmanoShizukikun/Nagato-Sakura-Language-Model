@@ -1257,9 +1257,6 @@ class NagatoSakuraForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
-        # 統一的採樣器 - 解決一致性問題的關鍵
-        self.sampler = GenerationSampler(config)
-
         # 初始化權重
         self.post_init()
 
@@ -1433,7 +1430,8 @@ class NagatoSakuraForCausalLM(nn.Module):
         self.eval()
         
         # 設置生成狀態以確保一致性 - 完全重置狀態
-        self.sampler.set_generation_state(generation_seed, reset_stats=True)
+        sampler = GenerationSampler(self.config)
+        sampler.set_generation_state(generation_seed, reset_stats=True)
 
         # 獲取配置中的默認值
         pad_token_id = pad_token_id or getattr(self.config, 'pad_token_id', None)
@@ -1486,7 +1484,7 @@ class NagatoSakuraForCausalLM(nn.Module):
                 next_token_logits = outputs.logits[:, -1, :]
                 
                 # 使用統一的採樣邏輯
-                next_tokens = self.sampler.apply_sampling(
+                next_tokens = sampler.apply_sampling(
                     logits=next_token_logits,
                     temperature=temperature,
                     top_k=top_k,
@@ -1549,7 +1547,8 @@ class NagatoSakuraForCausalLM(nn.Module):
         self.eval()
 
         # 與非流式生成保持一致的種子與採樣狀態
-        self.sampler.set_generation_state(generation_seed, reset_stats=True)
+        sampler = GenerationSampler(self.config)
+        sampler.set_generation_state(generation_seed, reset_stats=True)
         
         # 初始化
         batch_size, input_length = input_ids.shape
@@ -1595,7 +1594,7 @@ class NagatoSakuraForCausalLM(nn.Module):
                 past_key_values = outputs.past_key_values
 
                 # 與 generate 共用統一採樣邏輯，確保 top_p / repetition_penalty 一致生效
-                next_tokens = self.sampler.apply_sampling(
+                next_tokens = sampler.apply_sampling(
                     logits=logits,
                     temperature=temperature,
                     top_k=top_k,

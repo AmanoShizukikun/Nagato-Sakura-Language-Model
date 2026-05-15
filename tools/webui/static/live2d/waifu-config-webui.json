@@ -1,0 +1,49 @@
+{
+  "message": {
+    "default": ["Hello, I am Nagato Sakura."],
+    "console": "Console opened.",
+    "copy": "Copied. Please credit the source.",
+    "visibilitychange": "Welcome back.",
+    "changeSuccess": "Outfit changed.",
+    "changeFail": "No other outfits.",
+    "photo": "Snapshot saved.",
+    "goodbye": "See you next time.",
+    "hitokoto": ["Remember to take breaks.", "Stay hydrated.", "Focus on one step at a time."],
+    "welcome": "<span>Welcome to \"$1\"</span>",
+    "referrer": "Hello from <span>$1</span>",
+    "hoverBody": ["Need anything?"],
+    "tapBody": ["Hey!", "That tickles."],
+    "animations": [
+      "animations/idle_01.motion3.json",
+      "animations/idle_02.motion3.json",
+      "animations/hiyori_m01.motion3.json",
+      "animations/hiyori_m02.motion3.json",
+      "animations/hiyori_m03.motion3.json"
+    ]
+  },
+  "modelMessages": {
+    "NS-V5": {
+      "default": ["Welcome back, Master."],
+      "hitokoto": ["I am here to help."],
+      "tapBody": ["Please be gentle."],
+      "hoverBody": ["Anything you need?"]
+    }
+  },
+  "mouseover": [],
+  "click": [],
+  "seasons": [],
+  "time": [],
+  "pageMessages": {},
+  "models": [
+    {
+      "name": "NS-V5",
+      "paths": ["/static/live2d/model/NS-V5-Ver1.2/NS-V5-Ver1.2.model3.json"],
+      "message": "Nagato Sakura ready.",
+      "textures": [],
+      "paramOutfits": {
+        "paramId": "ParamCloth",
+        "values": [-2, -1, 0, 1]
+      }
+    }
+  ]
+}

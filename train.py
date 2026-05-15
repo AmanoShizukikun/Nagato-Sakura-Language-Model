@@ -29,7 +29,7 @@ def main():
 
     # 數據相關
     parser.add_argument("--training_data_file", type=str, help="訓練數據來源（檔案或資料夾）；未指定時使用 data/train")
-    parser.add_argument("--output_dir", type=str, default="NS-LLM-1.3", help="輸出目錄")
+    parser.add_argument("--output_dir", type=str, default="NS-LLM-1.4", help="輸出目錄")
     parser.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
     parser.add_argument("--eval_split_ratio", type=float, default=0.0, help="評估集分割比例（使用固定評估集時請設為0）")
     parser.add_argument("--eval_data_file", type=str, help="固定評估集來源（檔案或資料夾）；未指定時使用 data/eval")
@@ -42,6 +42,9 @@ def main():
     parser.add_argument("--tokenizer_universal_charset", action="store_true", default=True, help="啟用萬能分詞器分層保底（UTF-8 byte/中英日/注音/emoji/程式符號）")
     parser.add_argument("--no_tokenizer_universal_charset", action="store_false", dest="tokenizer_universal_charset", help="禁用萬能分詞器保底字元")
     parser.add_argument("--tokenizer_extra_chars_file", action="append", default=[], help="額外保底字元/詞彙檔案（例如甲乙丙字表），可重複指定")
+    parser.add_argument("--tokenizer_random_sampling", action="store_true", default=True, help="對大規模訓練數據進行隨機採樣（>10萬自動啟用）")
+    parser.add_argument("--no_tokenizer_random_sampling", action="store_false", dest="tokenizer_random_sampling", help="禁用分詞器隨機採樣")
+    parser.add_argument("--tokenizer_sample_ratio", type=float, default=0.1, help="分詞器採樣比率（當數據>10萬時自動應用，值為0.0-1.0）")
     parser.add_argument("--hidden_size", type=int, default=512, help="隱藏層大小")
     parser.add_argument("--num_layers", type=int, default=8, help="層數")
     parser.add_argument("--num_heads", type=int, default=8, help="注意力頭數")
@@ -59,11 +62,11 @@ def main():
     # 訓練參數
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="梯度累積步數")
-    parser.add_argument("--num_epochs", type=int, default=150, help="訓練輪數")
+    parser.add_argument("--num_epochs", type=int, default=50, help="訓練輪數")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="學習率")
     parser.add_argument("--weight_decay", type=float, default=0.005, help="權重衰減")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
-    parser.add_argument("--warmup_ratio", type=float, default=0.01, help="預熱比例")
+    parser.add_argument("--warmup_ratio", type=float, default=0, help="預熱比例")
     parser.add_argument("--max_grad_norm", type=float, default=0.7, help="梯度裁剪閾值")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="啟用梯度檢查點")
     parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing", help="禁用梯度檢查點")
@@ -204,6 +207,8 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
                     tokenizer_num_threads=args.tokenizer_num_threads,
                     tokenizer_enable_universal_charset=args.tokenizer_universal_charset,
                     tokenizer_extra_chars_files=args.tokenizer_extra_chars_file,
+                    tokenizer_random_sampling=args.tokenizer_random_sampling,
+                    tokenizer_sample_ratio=args.tokenizer_sample_ratio,
                 )
                 dist.barrier()
             else:
@@ -224,6 +229,8 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
                 tokenizer_num_threads=args.tokenizer_num_threads,
                 tokenizer_enable_universal_charset=args.tokenizer_universal_charset,
                 tokenizer_extra_chars_files=args.tokenizer_extra_chars_file,
+                tokenizer_random_sampling=args.tokenizer_random_sampling,
+                tokenizer_sample_ratio=args.tokenizer_sample_ratio,
             )
 
         model_config = NSConfig(
