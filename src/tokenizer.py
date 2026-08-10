@@ -5,10 +5,10 @@ import random
 import string
 import unicodedata
 from pathlib import Path
-from typing import Iterator, Optional, Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
+from transformers import PreTrainedTokenizerFast
 
 
 class TokenizerManager:
@@ -315,58 +315,18 @@ class TokenizerManager:
         "<|endoftext|>",
         "<|im_start|>",
         "<|im_end|>",
-        "<|object_ref_start|>",
-        "<|object_ref_end|>",
-        "<|box_start|>",
-        "<|box_end|>",
-        "<|quad_start|>",
-        "<|quad_end|>",
-        "<|vision_start|>",
-        "<|vision_end|>",
-        "<|vision_pad|>",
-        "<|image_pad|>",
-        "<|video_pad|>",
-        "<|audio_start|>",
-        "<|audio_end|>",
-        "<|audio_pad|>",
-        "<tts_pad>",
-        "<tts_text_bos>",
-        "<tts_text_eod>",
-        "<tts_text_bos_single>",
         "<think>",
         "</think>",
         "<tool_call>",
         "</tool_call>",
         "<tool_response>",
         "</tool_response>",
-        "<analysis>",
-        "</analysis>",
-        "<answer>",
-        "</answer>",
-        "<memory>",
-        "</memory>",
         "<system>",
         "</system>",
         "<user>",
         "</user>",
         "<assistant>",
         "</assistant>",
-        "<function>",
-        "</function>",
-        "<code>",
-        "</code>",
-        "<json>",
-        "</json>",
-        "<xml>",
-        "</xml>",
-        "<python>",
-        "</python>",
-        "<html>",
-        "</html>",
-        "<markdown>",
-        "</markdown>",
-        "<sql>",
-        "</sql>",
     ]
 
     BUILTIN_PROGRAMMING_TOKENS: List[str] = [
@@ -415,8 +375,6 @@ class TokenizerManager:
         "ORDER",
         "LIMIT",
         "<!DOCTYPE",
-        "<html>",
-        "</html>",
         "<head>",
         "</head>",
         "<body>",
@@ -480,15 +438,16 @@ class TokenizerManager:
         "\\r",
     ]
 
-    # Windows（繁體中文）常用符號：含全形標點、書名號、括號、數學與常見記號。
+    # Windows（繁體中文）常用符號：含全形標點、書名號、括號、數學與常見記號（已嚴格去重與補全）。
     BUILTIN_WINDOWS_ZH_TW_SYMBOLS: str = (
-        "，。、；：？！﹖﹗．‧·…‥—～﹏﹋﹌﹩﹪＠＃＆＊＋－×÷＝≠≈≒"
+        "，。、；：？！﹖﹗．‧·…‥—～﹏﹋﹌﹩﹪＠＃＆＊＋－×÷＝≠≈≒﹒"
         "≤≥∞∴∵℃℉°′″％‰§※◎●○◆◇■□▲△▼▽★☆♂♀"
         "→←↑↓↔↕↗↘↙↖↩↪"
         "（）［］｛｝〈〉《》「」『』【】〔〕〖〗〘〙〚〛"
         "︵︶︷︸︹︺︻︼︽︾︿﹀﹁﹂﹃﹄︱︳︴"
         "﹙﹚﹛﹜﹝﹞﹤﹥﹦"
-        "￥￠￡€™©®"
+        "￥￠￡€™©®₩₿αβγπΩμ±"
+        "‘’“”"
     )
 
     COMMON_SYMBOL_BLOCK_RANGES: List[Tuple[int, int]] = [
@@ -520,7 +479,7 @@ class TokenizerManager:
     ]
 
     _COMMON_SYMBOL_TOKENS_CACHE: Optional[List[str]] = None
-    
+
     def __init__(self, tokenizer_path: Path):
         self.tokenizer_path = tokenizer_path
         self.logger = logging.getLogger(__name__)
@@ -576,6 +535,10 @@ class TokenizerManager:
 
         return cls._sort_tokens(list(cls._bytes_to_unicode().values()))
 
+    # --------------------------------------------------------------------------
+    # 1. 字元與萬能保底詞表建構 (Character & Universal Charset Builders)
+    # --------------------------------------------------------------------------
+
     @classmethod
     def _build_base_layer_tokens(cls) -> List[str]:
         tokens: List[str] = []
@@ -592,10 +555,8 @@ class TokenizerManager:
     def _build_traditional_zh_layer_tokens(cls) -> List[str]:
         tokens: List[str] = []
 
-        # 繁中核心：教育部常用字 + 注音與聲調 + 全形標點。
+        # 繁中核心：教育部常用字 4808 字 + 注音與聲調 + 全形標點。
         tokens.extend(list(dict.fromkeys(cls.BUILTIN_ZH_COMMON_4808)))
-        tokens.extend(list(dict.fromkeys(cls.BUILTIN_ZH_TABLE_YI)))
-        tokens.extend(list(dict.fromkeys(cls.BUILTIN_ZH_TABLE_BING)))
         for start, end in [
             (0x02C7, 0x02CB),
             (0x02D9, 0x02D9),
@@ -607,6 +568,51 @@ class TokenizerManager:
             tokens.extend(cls._iter_codepoint_chars(start, end))
 
         return cls._sort_tokens(tokens)
+
+    @classmethod
+    def _build_zh_table_yi_layer_tokens(cls) -> List[str]:
+        tokens: List[str] = []
+        tokens.extend(list(dict.fromkeys(cls.BUILTIN_ZH_TABLE_YI)))
+        return cls._sort_tokens(tokens)
+
+    @classmethod
+    def _build_zh_table_bing_layer_tokens(cls) -> List[str]:
+        tokens: List[str] = []
+        tokens.extend(list(dict.fromkeys(cls.BUILTIN_ZH_TABLE_BING)))
+        return cls._sort_tokens(tokens)
+
+    @classmethod
+    def _build_default_universal_layers(
+        cls,
+        enable_zh_common: bool = True,
+        enable_zh_yi: bool = False,
+        enable_zh_bing: bool = False,
+        enable_ja: bool = True,
+        enable_emoji: bool = True,
+        enable_symbols: bool = True,
+        enable_programming: bool = False,
+    ) -> Dict[str, List[str]]:
+        raw_layers: Dict[str, List[str]] = {
+            "base_utf8": cls._build_base_layer_tokens(),
+            "english_alnum": cls._build_english_alnum_layer_tokens(),
+        }
+        if enable_zh_common:
+            raw_layers["zh_common"] = cls._build_traditional_zh_layer_tokens()
+        if enable_zh_yi:
+            raw_layers["zh_yi"] = cls._build_zh_table_yi_layer_tokens()
+        if enable_zh_bing:
+            raw_layers["zh_bing"] = cls._build_zh_table_bing_layer_tokens()
+        if enable_ja:
+            raw_layers["japanese"] = cls._build_japanese_layer_tokens()
+        if enable_emoji:
+            raw_layers["emoji"] = cls._build_emoji_layer_tokens()
+        if enable_symbols:
+            raw_layers["symbols"] = cls._build_common_symbols_layer_tokens()
+        if enable_programming:
+            raw_layers["programming"] = cls._build_programming_layer_tokens()
+
+        # 層級優先序去重：前層保留，後層排除已出現 token，避免跨層重複。
+        return cls._dedupe_layers_in_order(raw_layers)
 
     @classmethod
     def _build_english_alnum_layer_tokens(cls) -> List[str]:
@@ -670,7 +676,7 @@ class TokenizerManager:
         ]:
             tokens.extend(cls._iter_codepoint_chars(start, end))
 
-        tokens.extend(["\u200d", "\ufe0f", "\u20e3", "\ufe0e", "\U000E007F"])
+        tokens.extend(["\u200d", "\ufe0f", "\u20e3", "\ufe0e", "\U000e007f"])
         tokens.extend(cls._iter_codepoint_chars(0xE0020, 0xE007E))
 
         return cls._sort_tokens(tokens)
@@ -736,16 +742,41 @@ class TokenizerManager:
         return deduped_layers
 
     @classmethod
-    def _build_default_universal_layers(cls) -> Dict[str, List[str]]:
-        raw_layers = {
+    def _build_zh_table_yi_layer_tokens(cls) -> List[str]:
+        tokens: List[str] = []
+        for ch in cls.BUILTIN_ZH_TABLE_YI:
+            tokens.append(ch)
+        return cls._sort_tokens(tokens)
+
+    @classmethod
+    def _build_default_universal_layers(
+        cls,
+        enable_zh_common: bool = True,
+        enable_zh_yi: bool = False,
+        enable_zh_bing: bool = False,
+        enable_ja: bool = True,
+        enable_emoji: bool = True,
+        enable_symbols: bool = True,
+        enable_programming: bool = False,
+    ) -> Dict[str, List[str]]:
+        raw_layers: Dict[str, List[str]] = {
             "base_utf8": cls._build_base_layer_tokens(),
-            "zh_traditional": cls._build_traditional_zh_layer_tokens(),
             "english_alnum": cls._build_english_alnum_layer_tokens(),
-            "japanese": cls._build_japanese_layer_tokens(),
-            "emoji": cls._build_emoji_layer_tokens(),
-            "symbols": cls._build_common_symbols_layer_tokens(),
-            "programming": cls._build_programming_layer_tokens(),
         }
+        if enable_zh_common:
+            raw_layers["zh_common"] = cls._build_traditional_zh_layer_tokens()
+        if enable_zh_yi:
+            raw_layers["zh_yi"] = cls._build_zh_table_yi_layer_tokens()
+        if enable_zh_bing:
+            raw_layers["zh_bing"] = cls._build_zh_table_bing_layer_tokens()
+        if enable_ja:
+            raw_layers["japanese"] = cls._build_japanese_layer_tokens()
+        if enable_emoji:
+            raw_layers["emoji"] = cls._build_emoji_layer_tokens()
+        if enable_symbols:
+            raw_layers["symbols"] = cls._build_common_symbols_layer_tokens()
+        if enable_programming:
+            raw_layers["programming"] = cls._build_programming_layer_tokens()
 
         # 層級優先序去重：前層保留，後層排除已出現 token，避免跨層重複。
         return cls._dedupe_layers_in_order(raw_layers)
@@ -756,6 +787,10 @@ class TokenizerManager:
         for layer_tokens in cls._build_default_universal_layers().values():
             tokens.extend(layer_tokens)
         return cls._sort_tokens(tokens)
+
+    # --------------------------------------------------------------------------
+    # 2. 檔案讀取與保底 Token 載入 (File Readers & Token Loaders)
+    # --------------------------------------------------------------------------
 
     def _read_text_file_with_fallback(self, file_path: Path) -> str:
         encodings = ["utf-8-sig", "utf-8", "cp950", "big5", "utf-16"]
@@ -812,21 +847,40 @@ class TokenizerManager:
 
     def _build_guaranteed_tokens(
         self,
-        enable_universal_charset: bool,
-        extra_chars_files: Optional[List[str]],
+        enable_universal_charset: bool = True,
+        extra_chars_files: Optional[List[str]] = None,
+        enable_zh_common: bool = True,
+        enable_zh_yi: bool = False,
+        enable_zh_bing: bool = False,
+        enable_ja: bool = True,
+        enable_emoji: bool = True,
+        enable_symbols: bool = True,
+        enable_programming: bool = False,
     ) -> List[str]:
         tokens: List[str] = []
 
         if bool(enable_universal_charset):
-            layered_tokens = self._build_default_universal_layers()
+            layered_tokens = self._build_default_universal_layers(
+                enable_zh_common=enable_zh_common,
+                enable_zh_yi=enable_zh_yi,
+                enable_zh_bing=enable_zh_bing,
+                enable_ja=enable_ja,
+                enable_emoji=enable_emoji,
+                enable_symbols=enable_symbols,
+                enable_programming=enable_programming,
+            )
+            layer_summaries = []
             for layer_name, layer_values in layered_tokens.items():
                 tokens.extend(layer_values)
-                self.logger.info(f"萬能分詞器分層載入: {layer_name} ({len(layer_values)} tokens)")
+                layer_summaries.append(f"{layer_name}: {len(layer_values)}")
+            self.logger.info(
+                f"萬能分詞器保底分層 (共 {len(layered_tokens)} 層): {', '.join(layer_summaries)}"
+            )
 
-        for extra_file in (extra_chars_files or []):
+        for extra_file in extra_chars_files or []:
             tokens.extend(self._load_tokens_from_file(extra_file, "額外字表"))
 
-        reserved = set(self.REQUIRED_SPECIAL_TOKENS.values())
+        reserved = set(self.REQUIRED_SPECIAL_TOKENS.values()).union(set(self.BUILTIN_CONTROL_TOKENS))
         filtered: List[str] = []
         for token in tokens:
             if token is None:
@@ -841,8 +895,12 @@ class TokenizerManager:
         self.logger.info(f"萬能分詞器保底 token 已準備: {len(guaranteed)}")
         return guaranteed
 
-    @staticmethod
-    def _create_fast_tokenizer(tokenizer_object: Any) -> PreTrainedTokenizerFast:
+    # --------------------------------------------------------------------------
+    # 3. Tokenizer 建立與 UTF-8 健檢 (Tokenizer Creation & Health Checks)
+    # --------------------------------------------------------------------------
+
+    @classmethod
+    def _create_fast_tokenizer(cls, tokenizer_object: Any) -> PreTrainedTokenizerFast:
         return PreTrainedTokenizerFast(
             tokenizer_object=tokenizer_object,
             unk_token="<unk>",
@@ -850,6 +908,7 @@ class TokenizerManager:
             bos_token="<s>",
             eos_token="</s>",
             mask_token="<mask>",
+            additional_special_tokens=cls.BUILTIN_CONTROL_TOKENS,
         )
 
     def _read_tokenizer_model_settings(self) -> Dict[str, Any]:
@@ -940,12 +999,17 @@ class TokenizerManager:
             self.logger.warning(message)
         else:
             self.logger.info("分詞器 UTF-8 健檢通過（Byte-level BPE + byte fallback）。")
-    
+
+    # --------------------------------------------------------------------------
+    # 4. 載入、訓練與準備 API (Load, Train & Preparation APIs)
+    # --------------------------------------------------------------------------
+
     def load_tokenizer(self):
         """加載分詞器"""
         if self.tokenizer_path.exists():
             try:
                 from tokenizers import Tokenizer
+
                 self.tokenizer_object = Tokenizer.from_file(str(self.tokenizer_path))
                 self.transformers_tokenizer = self._create_fast_tokenizer(self.tokenizer_object)
                 self._validate_utf8_readiness(strict=False)
@@ -955,7 +1019,7 @@ class TokenizerManager:
                 raise
         else:
             raise FileNotFoundError("分詞器文件不存在")
-    
+
     def create_and_train_tokenizer(
         self,
         texts_iterator: Iterator[str],
@@ -969,6 +1033,7 @@ class TokenizerManager:
         # 記憶體監控
         try:
             import psutil
+
             process = psutil.Process(os.getpid())
             mem_info_before = process.memory_info()
             mem_percent_before = process.memory_percent()
@@ -984,23 +1049,20 @@ class TokenizerManager:
                 )
         except ImportError:
             pass
-        
+
         previous_tokenizers_parallelism = os.environ.get("TOKENIZERS_PARALLELISM")
         previous_rayon_threads = os.environ.get("RAYON_NUM_THREADS")
         tokenizers_parallelism_override_applied = False
         rayon_override_applied = False
         try:
-            from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
+            from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
 
-            # 讓 Rust tokenizers 明確啟用平行化，並允許手動指定執行緒。
             if previous_tokenizers_parallelism is None:
                 os.environ["TOKENIZERS_PARALLELISM"] = "true"
                 tokenizers_parallelism_override_applied = True
             if num_threads and int(num_threads) > 0:
                 os.environ["RAYON_NUM_THREADS"] = str(max(1, int(num_threads)))
                 rayon_override_applied = True
-            
-            # 創建 UTF-8 安全的 Byte-level BPE 分詞器。
             try:
                 tokenizer = Tokenizer(models.BPE(unk_token="<unk>", byte_fallback=True))
             except TypeError:
@@ -1012,24 +1074,17 @@ class TokenizerManager:
 
             tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
             tokenizer.decoder = decoders.ByteLevel()
-            
-            # 特殊令牌
-            special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
-            
-            guaranteed_single_chars: List[str] = []
-            if guaranteed_tokens:
-                guaranteed_single_chars = [token for token in guaranteed_tokens if len(token) == 1]
+            control_tokens = list(self.BUILTIN_CONTROL_TOKENS)
+            special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"] + control_tokens
+            byte_level_alphabet = self._sort_tokens(list(pre_tokenizers.ByteLevel.alphabet()))
 
-            # 訓練器
             try:
                 trainer = trainers.BpeTrainer(
                     vocab_size=vocab_size,
                     special_tokens=special_tokens,
                     min_frequency=max(1, int(min_frequency)),
                     show_progress=True,
-                    initial_alphabet=self._sort_tokens(
-                        list(set(pre_tokenizers.ByteLevel.alphabet()) | set(guaranteed_single_chars))
-                    ),
+                    initial_alphabet=byte_level_alphabet,
                 )
             except TypeError:
                 self.logger.warning(
@@ -1042,14 +1097,26 @@ class TokenizerManager:
                     min_frequency=max(1, int(min_frequency)),
                     show_progress=True,
                 )
-            
-            # 訓練
             self.logger.info(f"開始訓練分詞器，目標詞彙量: {vocab_size}")
             if total_texts is not None and total_texts > 0:
                 self.logger.info(f"分詞器語料總文本數: {total_texts}")
-                tokenizer.train_from_iterator(texts_iterator, trainer=trainer, length=int(total_texts))
+                tokenizer.train_from_iterator(
+                    texts_iterator, trainer=trainer, length=int(total_texts)
+                )
             else:
                 tokenizer.train_from_iterator(texts_iterator, trainer=trainer)
+
+            # 註冊控制 / 指令 Token 為 Special Token (special=True)
+            control_added_tokens = [
+                AddedToken(t, special=True, normalized=False) for t in control_tokens
+            ]
+            try:
+                added_special_count = int(tokenizer.add_special_tokens(control_added_tokens))
+                self.logger.info(
+                    f"已註冊指令與角色 Special Tokens: 請求 {len(control_added_tokens)}, 實質新增 {added_special_count}"
+                )
+            except Exception as e:
+                self.logger.warning(f"註冊 Special Tokens 失敗，退回常規處理: {e}")
 
             guaranteed_tokens_list: List[str] = []
             if guaranteed_tokens:
@@ -1058,26 +1125,23 @@ class TokenizerManager:
                     try:
                         added_count = int(tokenizer.add_tokens(guaranteed_tokens_list))
                         self.logger.info(
-                            f"已加入保底 token: 請求 {len(guaranteed_tokens_list)}, 新增 {added_count}"
+                            f"已加入全量中文與標點保底 token: 請求 {len(guaranteed_tokens_list)}, 實質新增 {added_count}"
                         )
                     except Exception as e:
                         self.logger.warning(f"加入保底 token 失敗，將僅依賴 BPE/byte fallback: {e}")
-            
-            # 保存
+
+            self.tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
             tokenizer.save(str(self.tokenizer_path))
             self.logger.info(f"分詞器已保存到: {self.tokenizer_path}")
-            
-            # 包裝
             self.tokenizer_object = tokenizer
             self.transformers_tokenizer = self._create_fast_tokenizer(tokenizer)
             self._validate_utf8_readiness(strict=True)
-            
+
             actual_vocab_size = len(self.transformers_tokenizer)
             self.logger.info(f"分詞器訓練完成，實際詞彙量: {actual_vocab_size}")
-            
-            # 訓練後記憶體監控
             try:
                 import psutil
+
                 process = psutil.Process(os.getpid())
                 mem_info_after = process.memory_info()
                 mem_percent_after = process.memory_percent()
@@ -1088,7 +1152,7 @@ class TokenizerManager:
                 )
             except Exception:
                 pass
-            
+
         except Exception as e:
             self.logger.error(f"分詞器訓練失敗: {e}")
             raise
@@ -1103,7 +1167,7 @@ class TokenizerManager:
                     os.environ.pop("RAYON_NUM_THREADS", None)
                 else:
                     os.environ["RAYON_NUM_THREADS"] = previous_rayon_threads
-    
+
     def prepare_tokenizer(
         self,
         training_data: list,
@@ -1116,6 +1180,13 @@ class TokenizerManager:
         extra_chars_files: Optional[List[str]] = None,
         tokenizer_random_sampling: bool = True,
         tokenizer_sample_ratio: float = 0.5,
+        enable_zh_common: bool = True,
+        enable_zh_yi: bool = False,
+        enable_zh_bing: bool = False,
+        enable_ja: bool = True,
+        enable_emoji: bool = True,
+        enable_symbols: bool = True,
+        enable_programming: bool = False,
     ):
         """準備分詞器"""
 
@@ -1148,7 +1219,7 @@ class TokenizerManager:
             return "", "", ""
 
         tokenizer_exists = self.tokenizer_path.exists()
-        
+
         if not force_retrain and tokenizer_exists:
             self.logger.info("使用現有分詞器")
             try:
@@ -1164,34 +1235,35 @@ class TokenizerManager:
                         "請使用 --no_resume --force_retrain_tokenizer 開新 run 重建 tokenizer。"
                         f" 詳細: {'; '.join(legacy_issues)}"
                     )
-        
+
         if force_retrain or not self.transformers_tokenizer:
             self.logger.info("訓練新分詞器...")
             guaranteed_tokens = self._build_guaranteed_tokens(
                 enable_universal_charset=enable_universal_charset,
                 extra_chars_files=extra_chars_files,
+                enable_zh_common=enable_zh_common,
+                enable_zh_yi=enable_zh_yi,
+                enable_zh_bing=enable_zh_bing,
+                enable_ja=enable_ja,
+                enable_emoji=enable_emoji,
+                enable_symbols=enable_symbols,
+                enable_programming=enable_programming,
             )
 
-            # 改進的採樣邏輯：隨機採樣而非順序切片
-            
             total_input_samples = len(training_data)
             sample_cap = int(max_training_samples) if max_training_samples else 0
-            
-            # 決定採樣數量
             if sample_cap > 0:
-                # 明確指定上限
                 target_samples = min(sample_cap, total_input_samples)
                 self.logger.info(
                     f"分詞器訓練樣本上限: {sample_cap}（數據集大小: {total_input_samples}，"
                     f"將使用: {target_samples}）"
                 )
             elif total_input_samples > 100_000:
-                # 自動降採樣：超過 10 萬自動應用比率採樣
                 if tokenizer_random_sampling and tokenizer_sample_ratio > 0:
                     target_samples = max(10_000, int(total_input_samples * tokenizer_sample_ratio))
                     self.logger.warning(
                         f"分詞器訓練數據大 ({total_input_samples})，啟用隨機採樣 "
-                        f"(比率: {tokenizer_sample_ratio*100:.1f}%) → {target_samples} 筆"
+                        f"(比率: {tokenizer_sample_ratio * 100:.1f}%) → {target_samples} 筆"
                     )
                 else:
                     target_samples = total_input_samples
@@ -1201,27 +1273,26 @@ class TokenizerManager:
                     )
             else:
                 target_samples = total_input_samples
-            
-            # 進行隨機採樣
+
             if target_samples < total_input_samples and tokenizer_random_sampling:
-                # 隨機打亂索引並取前 N 筆（等同於隨機採樣）
                 indices = list(range(total_input_samples))
-                random.seed(42)  # 使用固定種子以保證可復現性
+                random.seed(42)
                 random.shuffle(indices)
                 selected_indices = sorted(indices[:target_samples])
                 training_subset = [training_data[i] for i in selected_indices]
                 self.logger.info(
                     f"已從 {total_input_samples} 筆隨機採樣 {target_samples} 筆 "
-                    f"(佔 {target_samples/total_input_samples*100:.1f}%) 用於分詞器訓練"
+                    f"(佔 {target_samples / total_input_samples * 100:.1f}%) 用於分詞器訓練"
                 )
             else:
                 training_subset = training_data
                 self.logger.info(f"使用全部 {target_samples} 筆數據訓練分詞器")
 
-            # 統計有效樣本
             valid_sample_count = 0
             invalid_count = 0
-            for item in tqdm(training_subset, desc="統計分詞樣本"):
+            for item in tqdm(
+                training_subset, desc="統計分詞樣本", ncols=115, bar_format="{l_bar}{bar}{r_bar}"
+            ):
                 if not isinstance(item, dict):
                     invalid_count += 1
                     continue
@@ -1247,18 +1318,27 @@ class TokenizerManager:
                     instruction, input_text, output = _extract_supervised_fields(item)
                     if not instruction or not output:
                         continue
-                    instruction_with_input = f"{instruction}\n{input_text}".strip() if input_text else instruction
+                    instruction_with_input = (
+                        f"{instruction}\n{input_text}".strip() if input_text else instruction
+                    )
                     yield instruction_with_input
                     yield output
-            
+
+            guaranteed_count = len(guaranteed_tokens) if guaranteed_tokens else 0
+            effective_bpe_target = max(256, target_vocab_size - guaranteed_count)
+            self.logger.info(
+                f"目標總詞彙量: {target_vocab_size}, 保底 token 數: {guaranteed_count} "
+                f"→ 計算得 BPE 訓練目標詞彙量: {effective_bpe_target}"
+            )
+
             self.create_and_train_tokenizer(
                 text_iterator(),
-                target_vocab_size,
+                effective_bpe_target,
                 min_frequency=min_frequency,
                 total_texts=total_texts,
                 num_threads=num_threads,
                 guaranteed_tokens=guaranteed_tokens,
             )
-        
+
         if self.transformers_tokenizer is None:
             raise RuntimeError("分詞器初始化失敗")

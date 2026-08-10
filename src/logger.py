@@ -1,36 +1,41 @@
+import csv
+import logging
 import os
 import sys
-import time
-import logging
-import csv
 import threading
-from pathlib import Path
+import time
 from collections import deque
-from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
-import torch
 import psutil
+import torch
 from tqdm import tqdm
+
 try:
     import GPUtil
 except ImportError:
     GPUtil = None
 
 
+import copy
+
+
 class ColoredFormatter(logging.Formatter):
-    """彩色日誌格式器"""
-    
+    """彩色日誌格式器（使用 copy.copy 避免就地竄改共享 LogRecord）"""
+
     COLORS = {
-        'DEBUG': '\033[36m',    # 青色
-        'INFO': '\033[32m',     # 綠色
-        'WARNING': '\033[33m',  # 黃色
-        'ERROR': '\033[31m',    # 紅色
-        'CRITICAL': '\033[35m', # 紫色
+        "DEBUG": "\033[36m",  # 青色
+        "INFO": "\033[32m",  # 綠色
+        "WARNING": "\033[33m",  # 黃色
+        "ERROR": "\033[31m",  # 紅色
+        "CRITICAL": "\033[35m",  # 紫色
     }
-    RESET = '\033[0m'
-    
+    RESET = "\033[0m"
+
     def format(self, record):
+        record = copy.copy(record)
         log_color = self.COLORS.get(record.levelname, self.RESET)
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)
@@ -50,37 +55,33 @@ class TqdmConsoleHandler(logging.StreamHandler):
 
 def setup_logging(output_dir: str, log_level: str = "INFO"):
     """設置增強的日誌系統"""
+    
+    os.environ["TQDM_NCOLS"] = "115"
     log_dir = Path(output_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # 創建根日誌記錄器
     logger = logging.getLogger()
     logger.setLevel(getattr(logging, log_level.upper()))
-    
+
     # 清除現有處理器
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    
+
     # 文件處理器
-    file_handler = logging.FileHandler(
-        log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log",
-        encoding='utf-8'
-    )
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    file_handler = logging.FileHandler(log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log", encoding="utf-8")
+    file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
-    
-    # 控制台處理器（彩色 + tqdm相容）
+
+    # 控制台處理器
     console_handler = TqdmConsoleHandler(sys.stdout)
-    console_formatter = ColoredFormatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
+    console_formatter = ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
-    
+    for quiet_logger_name in ["datasets", "urllib3", "filelock", "transformers"]:
+        logging.getLogger(quiet_logger_name).setLevel(logging.WARNING)
+
     return logging.getLogger(__name__)
 
 
@@ -191,7 +192,7 @@ class CSVMetricsWriter:
         headers = self.SCHEMAS[filename]
         payload = {k: row.get(k, "") for k in headers}
         if not payload.get("timestamp"):
-            payload["timestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            payload["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
         with self._lock:
             with open(self.metrics_dir / filename, "a", encoding="utf-8", newline="") as f:
@@ -215,48 +216,79 @@ class CSVMetricsWriter:
 
 
 class SystemMonitor:
-    """系統資源監控器"""
-    
-    def __init__(self):
-        self.gpu_available = torch.cuda.is_available()
+    """系統資源監控器（支援指定 PyTorch Device 與 Multi-GPU 視角）"""
+
+    def __init__(self, device: Optional[Union[str, torch.device]] = None):
+        if device is not None:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda:0")
+        else:
+            self.device = torch.device("cpu")
+
+        self.gpu_available = torch.cuda.is_available() and self.device.type == "cuda"
         self.memory_history = deque(maxlen=100)
         self.gpu_memory_history = deque(maxlen=100)
-    
+
     def get_system_info(self) -> Dict[str, Any]:
-        """獲取系統信息"""
+        """獲取系統資訊"""
+        
         info = {
             # 非阻塞取樣，避免訓練步驟被監控卡住
-            'cpu_percent': psutil.cpu_percent(interval=None),
-            'memory_percent': psutil.virtual_memory().percent,
-            'memory_used_gb': psutil.virtual_memory().used / (1024**3),
-            'memory_total_gb': psutil.virtual_memory().total / (1024**3),
+            "cpu_percent": psutil.cpu_percent(interval=None),
+            "memory_percent": psutil.virtual_memory().percent,
+            "memory_used_gb": psutil.virtual_memory().used / (1024**3),
+            "memory_total_gb": psutil.virtual_memory().total / (1024**3),
         }
-        
-        if self.gpu_available and GPUtil:
+
+        if self.gpu_available:
             try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    info.update({
-                        'gpu_memory_percent': gpu.memoryUtil * 100,
-                        'gpu_memory_used_gb': gpu.memoryUsed / 1024,
-                        'gpu_memory_total_gb': gpu.memoryTotal / 1024,
-                        'gpu_temperature': gpu.temperature,
-                        'gpu_load': gpu.load * 100
-                    })
+                device_idx = self.device.index if self.device.index is not None else 0
+                allocated_bytes = torch.cuda.memory_allocated(device_idx)
+                reserved_bytes = torch.cuda.memory_reserved(device_idx)
+                total_bytes = torch.cuda.get_device_properties(device_idx).total_memory
+                allocated_gb = allocated_bytes / (1024**3)
+                reserved_gb = reserved_bytes / (1024**3)
+                total_gb = total_bytes / (1024**3)
+                gpu_percent = (reserved_bytes / total_bytes) * 100 if total_bytes > 0 else 0.0
+                info.update(
+                    {
+                        "gpu_memory_percent": gpu_percent,
+                        "gpu_memory_used_gb": reserved_gb,
+                        "gpu_memory_allocated_gb": allocated_gb,
+                        "gpu_memory_total_gb": total_gb,
+                        "gpu_device_index": device_idx,
+                        "gpu_load": 0.0,
+                        "gpu_temperature": 0.0,
+                    }
+                )
+                if GPUtil:
+                    try:
+                        gpus = GPUtil.getGPUs()
+                        if gpus and device_idx < len(gpus):
+                            gpu = gpus[device_idx]
+                            info.update(
+                                {"gpu_temperature": gpu.temperature, "gpu_load": gpu.load * 100}
+                            )
+                    except Exception:
+                        pass
             except Exception:
                 pass
-        
+
         return info
-    
+
     def log_system_status(self, logger):
         """記錄系統狀態"""
-        info = self.get_system_info()
-        logger.info(f"系統狀態 - CPU: {info['cpu_percent']:.1f}%, "
-                   f"RAM: {info['memory_percent']:.1f}% "
-                   f"({info['memory_used_gb']:.1f}/{info['memory_total_gb']:.1f}GB)")
         
-        if 'gpu_memory_percent' in info:
-            logger.info(f"GPU狀態 - 記憶體: {info['gpu_memory_percent']:.1f}% "
-                       f"({info['gpu_memory_used_gb']:.1f}/{info['gpu_memory_total_gb']:.1f}GB), "
-                       f"負載: {info['gpu_load']:.1f}%, 溫度: {info['gpu_temperature']}°C")
+        info = self.get_system_info()
+        logger.info(
+            f"系統狀態 - CPU: {info['cpu_percent']:.1f}%, "
+            f"RAM: {info['memory_percent']:.1f}% "
+            f"({info['memory_used_gb']:.1f}/{info['memory_total_gb']:.1f}GB)"
+        )
+        if "gpu_memory_percent" in info:
+            logger.info(
+                f"GPU[{info.get('gpu_device_index', 0)}]狀態 - 記憶體: {info['gpu_memory_percent']:.1f}% "
+                f"({info['gpu_memory_used_gb']:.1f}/{info['gpu_memory_total_gb']:.1f}GB), "
+                f"負載: {info.get('gpu_load', 0.0):.1f}%, 溫度: {info.get('gpu_temperature', 0.0)}°C"
+            )

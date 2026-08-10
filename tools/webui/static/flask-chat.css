@@ -425,9 +425,10 @@ select {
 .conversation-list::-webkit-scrollbar,
 .chat-list::-webkit-scrollbar,
 .settings-panel::-webkit-scrollbar,
-.right-sidebar::-webkit-scrollbar {
-    width: 5px;
-    height: 5px;
+.right-sidebar::-webkit-scrollbar,
+.history-stage-panel::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
 }
 
 .conversation-list::-webkit-scrollbar {
@@ -448,6 +449,7 @@ select {
 .chat-list::-webkit-scrollbar-button,
 .settings-panel::-webkit-scrollbar-button,
 .right-sidebar::-webkit-scrollbar-button,
+.history-stage-panel::-webkit-scrollbar-button,
 #promptInput::-webkit-scrollbar-button {
     display: none !important;
     width: 0 !important;
@@ -457,7 +459,8 @@ select {
 .conversation-list::-webkit-scrollbar-track,
 .chat-list::-webkit-scrollbar-track,
 .settings-panel::-webkit-scrollbar-track,
-.right-sidebar::-webkit-scrollbar-track {
+.right-sidebar::-webkit-scrollbar-track,
+.history-stage-panel::-webkit-scrollbar-track {
     background: var(--c-bg2);
     border-radius: 999px;
 }
@@ -469,7 +472,8 @@ select {
 .conversation-list::-webkit-scrollbar-thumb,
 .chat-list::-webkit-scrollbar-thumb,
 .settings-panel::-webkit-scrollbar-thumb,
-.right-sidebar::-webkit-scrollbar-thumb {
+.right-sidebar::-webkit-scrollbar-thumb,
+.history-stage-panel::-webkit-scrollbar-thumb {
     background: var(--c-pink);
     border-radius: 999px;
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -478,7 +482,8 @@ select {
 .conversation-list::-webkit-scrollbar-thumb:hover,
 .chat-list::-webkit-scrollbar-thumb:hover,
 .settings-panel::-webkit-scrollbar-thumb:hover,
-.right-sidebar::-webkit-scrollbar-thumb:hover {
+.right-sidebar::-webkit-scrollbar-thumb:hover,
+.history-stage-panel::-webkit-scrollbar-thumb:hover {
     background-color: var(--c-pink);
     box-shadow: inset 0 0 0 10px rgba(255, 255, 255, 0.3);
 }
@@ -3059,3 +3064,204 @@ body[data-theme="obsidian"] .settings-nav-item.active { background: rgba(255,255
         width: 100%;
     }
 }
+
+#collapsedHistoryBtn {
+    display: none;
+}
+
+.left-sidebar.collapsed #collapsedHistoryBtn {
+    display: inline-flex;
+}
+
+.collapsed-history-btn {
+    align-items: center;
+    justify-content: center;
+    color: var(--accent-pink);
+    border-color: rgba(255, 105, 180, 0.3);
+    transition: all 0.2s ease;
+}
+
+.collapsed-history-btn:hover {
+    background: rgba(255, 105, 180, 0.2);
+    box-shadow: 0 0 12px rgba(255, 105, 180, 0.4);
+}
+
+.history-stage-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    width: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 24px;
+    gap: 20px;
+    background: var(--bg-surface);
+    backdrop-filter: blur(16px);
+    border-radius: 0 0 20px 20px;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: var(--c-pink) var(--c-bg2);
+}
+
+.history-stage-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid rgba(255, 105, 180, 0.2);
+}
+
+.history-stage-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.history-stage-title-wrap h2 {
+    margin: 0;
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: var(--fg-main);
+    background: linear-gradient(135deg, #ff69b4, #00d4ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.history-stage-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    border-radius: 12px;
+    background: rgba(255, 105, 180, 0.15);
+    color: var(--accent-pink);
+    border: 1px solid rgba(255, 105, 180, 0.3);
+}
+
+.history-stage-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.history-stage-search {
+    padding: 8px 14px;
+    font-size: 0.9rem;
+    border-radius: 12px;
+    border: 1px solid var(--border-soft);
+    background: rgba(0, 0, 0, 0.25);
+    color: var(--fg-main);
+    min-width: 240px;
+    outline: none;
+    transition: all 0.2s ease;
+}
+
+.history-stage-search:focus {
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.3);
+}
+
+.history-stage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    align-content: start;
+}
+
+.history-stage-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(20, 20, 35, 0.6);
+    cursor: pointer;
+    transition: all 0.22s ease;
+    position: relative;
+}
+
+.history-stage-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(0, 212, 255, 0.5);
+    box-shadow: 0 6px 20px rgba(0, 212, 255, 0.15);
+    background: rgba(25, 25, 45, 0.85);
+}
+
+.history-stage-card.active {
+    border-color: var(--accent-pink);
+    box-shadow: 0 0 16px rgba(255, 105, 180, 0.25);
+    background: rgba(40, 20, 45, 0.7);
+}
+
+.history-stage-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.history-stage-card-title {
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: var(--fg-main);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.history-stage-card-active-badge {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: var(--accent-pink);
+    color: #fff;
+    font-weight: 600;
+}
+
+.history-stage-card-snippet {
+    font-size: 0.86rem;
+    color: var(--fg-muted, #aaa);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    min-height: 2.4em;
+}
+
+.history-stage-card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 4px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 0.78rem;
+    color: var(--fg-subtle, #888);
+}
+
+.history-stage-card-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.history-stage-card-delete-btn {
+    background: transparent;
+    border: none;
+    color: #ff4d4d;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: background 0.15s ease;
+}
+
+.history-stage-card-delete-btn:hover {
+    background: rgba(255, 77, 77, 0.2);
+}
+

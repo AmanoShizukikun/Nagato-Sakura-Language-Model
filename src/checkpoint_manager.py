@@ -1,11 +1,11 @@
-import math
-import shutil
 import csv
 import json
+import math
+import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -28,16 +28,8 @@ class CheckpointManager:
         self.logger = logger
         self.records: List[Dict[str, Any]] = []
 
-    def should_save(
-        self,
-        epoch: int,
-        num_epochs: int,
-        eval_loss: Optional[float],
-        previous_best_eval_loss: float,
-        had_anomaly: bool = False,
-    ) -> List[str]:
+    def should_save(self, epoch: int, num_epochs: int, eval_loss: Optional[float], previous_best_eval_loss: float, had_anomaly: bool = False) -> List[str]:
         reasons: List[str] = []
-
         if self.policy.save_interval_epochs > 0 and (epoch + 1) % self.policy.save_interval_epochs == 0:
             reasons.append("interval")
 
@@ -55,21 +47,15 @@ class CheckpointManager:
 
         return reasons
 
-    def register_checkpoint(
-        self,
-        checkpoint_path: Path,
-        checkpoint_name: str,
-        epoch: int,
-        eval_loss: Optional[float],
-        is_best: bool,
-        reasons: List[str],
-    ):
+    def register_checkpoint(self, checkpoint_path: Path, checkpoint_name: str, epoch: int, eval_loss: Optional[float], is_best: bool, reasons: List[str]):
         self.records.append(
             {
                 "path": str(checkpoint_path),
                 "name": checkpoint_name,
                 "epoch": int(epoch),
-                "eval_loss": float(eval_loss) if eval_loss is not None and math.isfinite(eval_loss) else None,
+                "eval_loss": float(eval_loss)
+                if eval_loss is not None and math.isfinite(eval_loss)
+                else None,
                 "is_best": bool(is_best),
                 "reasons": list(reasons),
             }
@@ -91,7 +77,6 @@ class CheckpointManager:
             return
 
         keep_paths = set()
-
         if self.records:
             keep_paths.add(Path(self.records[-1]["path"]).resolve())
 
@@ -119,6 +104,7 @@ class CheckpointManager:
         parts = name.split("-")
         if not parts:
             return None
+        
         tail = parts[-1]
         return int(tail) if tail.isdigit() else None
 
@@ -131,11 +117,10 @@ class CheckpointManager:
                     total += p.stat().st_size
         except Exception:
             return 0.0
-        return total / (1024 ** 2)
+        return total / (1024**2)
 
     def export_index(self, metrics_dir: Path) -> Dict[str, Any]:
         metrics_dir.mkdir(parents=True, exist_ok=True)
-
         all_dirs: List[Path] = [p for p in self.output_dir.glob("checkpoint-*") if p.is_dir()]
         for special in ["best_model", "final_model"]:
             special_dir = self.output_dir / special
@@ -153,11 +138,9 @@ class CheckpointManager:
 
         record_map = {str(Path(r["path"]).resolve()): r for r in self.records}
         rows: List[Dict[str, Any]] = []
-
         for d in sorted(unique_dirs, key=lambda p: p.stat().st_mtime, reverse=True):
             resolved = str(d.resolve())
             record = record_map.get(resolved)
-
             row = {
                 "checkpoint_name": d.name,
                 "checkpoint_path": str(d),
@@ -166,7 +149,10 @@ class CheckpointManager:
                 "is_best": bool(record.get("is_best")) if record else (d.name == "best_model"),
                 "reasons": "|".join(record.get("reasons", [])) if record else "",
                 "size_mb": round(self._folder_size_mb(d), 3),
-                "modified_time": datetime.utcfromtimestamp(d.stat().st_mtime).isoformat(timespec="seconds") + "Z",
+                "modified_time": datetime.utcfromtimestamp(d.stat().st_mtime).isoformat(
+                    timespec="seconds"
+                )
+                + "Z",
                 "has_model": (d / "model.pt").exists(),
                 "has_state": (d / "training_state.pt").exists(),
             }
@@ -192,18 +178,16 @@ class CheckpointManager:
                 writer.writerow(row)
 
         valid_eval_rows = [r for r in rows if r.get("eval_loss") is not None and math.isfinite(float(r["eval_loss"]))]
-        best_row = min(valid_eval_rows, key=lambda x: float(x["eval_loss"])) if valid_eval_rows else None
+        best_row = (min(valid_eval_rows, key=lambda x: float(x["eval_loss"])) if valid_eval_rows else None)
         latest_row = rows[0] if rows else None
-
         overview = {
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "total_checkpoints": len(rows),
             "total_size_mb": round(sum(float(r.get("size_mb", 0.0)) for r in rows), 3),
             "best_checkpoint_path": best_row.get("checkpoint_path") if best_row else "",
             "best_eval_loss": best_row.get("eval_loss") if best_row else None,
             "latest_checkpoint_path": latest_row.get("checkpoint_path") if latest_row else "",
         }
-
         json_payload = {
             "overview": overview,
             "entries": rows,

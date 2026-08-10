@@ -21,7 +21,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from inference import InferenceConfig, NagatoSakuraInference
+from inference import InferenceConfig, NagatoSakuraInference, setup_logging
 
 
 INFERENCE_INSTANCE: NagatoSakuraInference | None = None
@@ -82,6 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_key_value_heads", type=int)
     parser.add_argument("--web_host", type=str, default="127.0.0.1")
     parser.add_argument("--web_port", type=int, default=8501)
+    parser.add_argument("--log_level", type=str, default="INFO")
+    # 權重量化選項
+    parser.add_argument("--weight_quantization", action="store_true", help="啟用權重量化")
+    parser.add_argument("--weight_quant_bits", type=int, choices=[4, 8], default=8)
+    parser.add_argument("--weight_quant_group_size", type=int, default=128)
+    parser.add_argument("--weight_quant_embeddings", action="store_true")
+    parser.add_argument("--weight_quant_lm_head", action="store_true")
+    parser.add_argument("--weight_quant_mode", type=str, default="auto", choices=["auto", "dynamic", "compressed"])
 
     args, _ = parser.parse_known_args()
 
@@ -177,6 +185,12 @@ def _build_inference(args: argparse.Namespace) -> NagatoSakuraInference:
         kv_residual_sign_correction=(True if args.kv_residual_sign_correction else None),
         num_key_value_heads=args.num_key_value_heads,
         stateless_chat=args.stateless_chat,
+        weight_quantization=bool(getattr(args, "weight_quantization", False)),
+        weight_quant_bits=int(getattr(args, "weight_quant_bits", 8)),
+        weight_quant_group_size=int(getattr(args, "weight_quant_group_size", 128)),
+        weight_quant_embeddings=bool(getattr(args, "weight_quant_embeddings", False)),
+        weight_quant_lm_head=bool(getattr(args, "weight_quant_lm_head", False)),
+        weight_quant_mode=str(getattr(args, "weight_quant_mode", "auto")),
     )
     return NagatoSakuraInference(config)
 
@@ -203,14 +217,22 @@ def index():
     if RUNTIME_ARGS is None:
         return "Runtime args not initialized", 500
 
+    try:
+        inference = get_inference()
+        model_ctx_len = inference.config.max_length
+        model_max_new = inference.config.max_new_tokens
+    except Exception:
+        model_ctx_len = RUNTIME_ARGS.max_length if (RUNTIME_ARGS and RUNTIME_ARGS.max_length > 0) else 2048
+        model_max_new = RUNTIME_ARGS.max_new_tokens if (RUNTIME_ARGS and RUNTIME_ARGS.max_new_tokens > 0) else model_ctx_len // 2
+
     bootstrap = {
         "modelPath": RUNTIME_ARGS.model_path,
         "tokenizerPath": RUNTIME_ARGS.tokenizer_path,
         "modelName": Path(RUNTIME_ARGS.model_path).name,
         "defaults": {
             "historyRounds": int(RUNTIME_ARGS.history_rounds),
-            "maxLength": int(RUNTIME_ARGS.max_length if RUNTIME_ARGS.max_length > 0 else 4096),
-            "maxNewTokens": int(RUNTIME_ARGS.max_new_tokens),
+            "maxLength": int(model_ctx_len),
+            "maxNewTokens": int(model_max_new),
             "temperature": float(RUNTIME_ARGS.temperature),
             "topK": int(RUNTIME_ARGS.top_k),
             "topP": float(RUNTIME_ARGS.top_p),
@@ -427,6 +449,10 @@ def main() -> None:
     global RUNTIME_ARGS
     RUNTIME_ARGS = parse_args()
 
+    logger = setup_logging(getattr(RUNTIME_ARGS, "log_level", "INFO"))
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
     model_path = Path(RUNTIME_ARGS.model_path)
     tokenizer_path = Path(RUNTIME_ARGS.tokenizer_path)
 
@@ -435,21 +461,32 @@ def main() -> None:
     if not tokenizer_path.exists():
         raise SystemExit(f"找不到 tokenizer.json: {tokenizer_path}")
 
-    print("🌸 Nagato Sakura Flask Web Demo")
-    print("=" * 50)
-    print(f"Model: {model_path}")
-    print(f"Tokenizer: {tokenizer_path}")
-    print(f"URL: http://{RUNTIME_ARGS.web_host}:{RUNTIME_ARGS.web_port}")
-    print("=" * 50)
+    logger.info("════════════════ [階段 2/2] 🌸 長門櫻 WebUI 服務發佈 ════════════════")
+    logger.info(f"模型載入路徑 - {model_path}")
+    logger.info(f"分詞器載入 - {tokenizer_path}")
+    logger.info(f"服務監聽網址 - http://{RUNTIME_ARGS.web_host}:{RUNTIME_ARGS.web_port} (按 Ctrl+C 結束服務)")
 
-    app.run(
-        host=RUNTIME_ARGS.web_host,
-        port=RUNTIME_ARGS.web_port,
-        debug=False,
-        threaded=True,
-        use_reloader=False,
-    )
+    try:
+        app.run(
+            host=RUNTIME_ARGS.web_host,
+            port=RUNTIME_ARGS.web_port,
+            debug=False,
+            threaded=True,
+            use_reloader=False,
+        )
+    except KeyboardInterrupt:
+        logger.info("Web 服務已由使用者安全終止。")
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     main()

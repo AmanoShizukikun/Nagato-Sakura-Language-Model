@@ -7,7 +7,7 @@ const DEFAULT_ACTIVE_SETTINGS_SECTION = "audioVideo";
 const TIME_PREVIEW_UPDATE_MS = 30000;
 const CHAT_UI_MODES = ["bubbleOnly", "avatarBubble", "discord"];
 const CHAT_BOTTOM_THRESHOLD_PX = 24;
-const SETTINGS_SECTIONS = ["profile", "audioVideo", "theme", "display", "shortcuts", "languageTime", "toolRegistry"];
+const SETTINGS_SECTIONS = ["profile", "audioVideo", "theme", "display", "shortcuts", "languageTime", "modelParams", "toolRegistry"];
 const DEFAULT_USER_NAME = "主人";
 const PROFILE_AVATAR_MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024;
 const PROFILE_AVATAR_MAX_DATA_URL_LENGTH = 2800000;
@@ -51,6 +51,7 @@ const state = {
     activeConversationId: null,
     isSending: false,
     sidebarCollapsed: false,
+    historyStageActive: false,
     editingConversationId: null,
     editingMessageIndex: null,
     settings: null,
@@ -156,8 +157,14 @@ const refs = {
     composerWrap: document.querySelector(".composer-wrap"),
     promptInput: document.getElementById("promptInput"),
     voiceVisualizer: document.getElementById("voiceVisualizer"),
-    micBtn: document.getElementById("micBtn"),
     toast: document.getElementById("toast"),
+    collapsedHistoryBtn: document.getElementById("collapsedHistoryBtn"),
+    historyStagePanel: document.getElementById("historyStagePanel"),
+    historyStageCount: document.getElementById("historyStageCount"),
+    historyStageSearchInput: document.getElementById("historyStageSearchInput"),
+    historyStageNewChatBtn: document.getElementById("historyStageNewChatBtn"),
+    historyStageCloseBtn: document.getElementById("historyStageCloseBtn"),
+    historyStageGrid: document.getElementById("historyStageGrid"),
     modelPath: document.getElementById("modelPath"),
     tokenizerPath: document.getElementById("tokenizerPath"),
     historyRounds: document.getElementById("historyRounds"),
@@ -346,8 +353,8 @@ function getDefaultSettings() {
         schemaVersion: SETTINGS_SCHEMA_VERSION,
         params: {
             historyRounds: clampNumber(defaults.historyRounds, 3, { min: 0, max: 40, integer: true }),
-            maxLength: clampNumber(defaults.maxLength, 4096, { min: 128, max: 8192, integer: true }),
-            maxNewTokens: clampNumber(defaults.maxNewTokens, 512, { min: 16, max: 4096, integer: true }),
+            maxLength: clampNumber(defaults.maxLength, 2048, { min: 128, max: 8192, integer: true }),
+            maxNewTokens: clampNumber(defaults.maxNewTokens, Math.floor((defaults.maxLength || 2048) / 2), { min: 16, max: 4096, integer: true }),
             topK: clampNumber(defaults.topK, 50, { min: 1, max: 200, integer: true }),
             temperature: clampNumber(defaults.temperature, 0.7, { min: 0.1, max: 1.8, digits: 2 }),
             topP: clampNumber(defaults.topP, 0.9, { min: 0.1, max: 1.0, digits: 2 }),
@@ -2540,14 +2547,14 @@ function sanitizeMarkdownUrl(rawUrl) {
 }
 
 function renderInlineMarkdownHtml(rawText) {
-    const segments = String(rawText || "").split(/(`[^`\n]+`)/g);
+    const segments = String(rawText || "").split(/(\x60[^\x60\n]+\x60)/g);
 
     return segments.map((segment) => {
         if (!segment) {
             return "";
         }
 
-        if (segment.startsWith("`") && segment.endsWith("`")) {
+        if (segment.startsWith("\x60") && segment.endsWith("\x60")) {
             return `<code>${escapeHtml(segment.slice(1, -1))}</code>`;
         }
 
@@ -3278,10 +3285,104 @@ function deleteConversation(conversationId) {
         }
     }
 
-    persistConversations();
+    saveConversationsToStorage();
     renderConversationList();
     renderActiveConversation();
-    showToast(TXT.toastDeleteConversation);
+}
+
+function selectConversationById(convId) {
+    if (state.isSending) return;
+    clearEditState();
+    state.activeConversationId = convId;
+    renderConversationList();
+    renderActiveConversation();
+}
+
+function openHistoryStageView() {
+    state.historyStageActive = true;
+    if (refs.historyStagePanel) {
+        refs.historyStagePanel.style.display = "flex";
+    }
+    if (refs.chatList) refs.chatList.style.display = "none";
+    if (refs.chatJumpWrap) refs.chatJumpWrap.style.display = "none";
+    if (refs.composerWrap) refs.composerWrap.style.display = "none";
+    renderHistoryStageGrid();
+}
+
+function closeHistoryStageView() {
+    state.historyStageActive = false;
+    if (refs.historyStagePanel) {
+        refs.historyStagePanel.style.display = "none";
+    }
+    if (refs.chatList) refs.chatList.style.display = "";
+    if (refs.chatJumpWrap) refs.chatJumpWrap.style.display = "";
+    if (refs.composerWrap) refs.composerWrap.style.display = "";
+}
+
+function renderHistoryStageGrid(query = "") {
+    if (!refs.historyStageGrid) return;
+    refs.historyStageGrid.innerHTML = "";
+
+    const q = (query || "").trim().toLowerCase();
+    const filtered = state.conversations.filter((conv) => {
+        if (!q) return true;
+        if ((conv.title || "").toLowerCase().includes(q)) return true;
+        return (conv.messages || []).some((m) => (m.content || "").toLowerCase().includes(q));
+    });
+
+    if (refs.historyStageCount) {
+        refs.historyStageCount.textContent = `共 ${filtered.length} 個對話`;
+    }
+
+    if (filtered.length === 0) {
+        const emptyDiv = document.createElement("div");
+        emptyDiv.className = "history-stage-empty";
+        emptyDiv.style.gridColumn = "1 / -1";
+        emptyDiv.style.textAlign = "center";
+        emptyDiv.style.padding = "40px 16px";
+        emptyDiv.style.color = "var(--fg-subtle, #888)";
+        emptyDiv.textContent = q ? "找不到符合條件的對話歷史紀錄" : "尚無過去聊天紀錄";
+        refs.historyStageGrid.appendChild(emptyDiv);
+        return;
+    }
+
+    for (const conv of filtered) {
+        const isCurrent = conv.id === state.activeConversationId;
+        const card = document.createElement("div");
+        card.className = `history-stage-card ${isCurrent ? "active" : ""}`;
+        card.dataset.id = conv.id;
+
+        const lastMsg = conv.messages && conv.messages.length > 0 ? conv.messages[conv.messages.length - 1] : null;
+        const snippet = lastMsg ? (lastMsg.content || "").slice(0, 120) : "無訊息內容";
+        const timeStr = conv.updatedAt ? new Date(conv.updatedAt).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+
+        card.innerHTML = `
+            <div class="history-stage-card-head">
+                <span class="history-stage-card-title">${escapeHtml(conv.title || "新對話")}</span>
+                ${isCurrent ? '<span class="history-stage-card-active-badge">當前對話</span>' : ""}
+            </div>
+            <div class="history-stage-card-snippet">${escapeHtml(snippet)}</div>
+            <div class="history-stage-card-footer">
+                <span>${conv.messages ? conv.messages.length : 0} 則訊息 · ${timeStr}</span>
+                <div class="history-stage-card-actions">
+                    <button type="button" class="history-stage-card-delete-btn" data-action="delete" title="刪除此對話">🗑️ 刪除</button>
+                </div>
+            </div>
+        `;
+
+        card.addEventListener("click", (e) => {
+            if (e.target.closest('[data-action="delete"]')) {
+                e.stopPropagation();
+                deleteConversation(conv.id);
+                renderHistoryStageGrid(refs.historyStageSearchInput ? refs.historyStageSearchInput.value : "");
+                return;
+            }
+            selectConversationById(conv.id);
+            closeHistoryStageView();
+        });
+
+        refs.historyStageGrid.appendChild(card);
+    }
 }
 
 function renderActiveConversation() {
@@ -3671,6 +3772,7 @@ function bindEvents() {
         if (state.isSending) {
             return;
         }
+        closeHistoryStageView();
         createConversation(false);
         renderConversationList();
         renderActiveConversation();
@@ -3680,6 +3782,7 @@ function bindEvents() {
         if (state.isSending) {
             return;
         }
+        closeHistoryStageView();
         createConversation(true);
         renderConversationList();
         renderActiveConversation();
@@ -3688,6 +3791,38 @@ function bindEvents() {
     refs.searchConversationInput.addEventListener("input", () => {
         renderConversationList();
     });
+
+    if (refs.collapsedHistoryBtn) {
+        refs.collapsedHistoryBtn.addEventListener("click", () => {
+            if (state.historyStageActive) {
+                closeHistoryStageView();
+            } else {
+                openHistoryStageView();
+            }
+        });
+    }
+
+    if (refs.historyStageNewChatBtn) {
+        refs.historyStageNewChatBtn.addEventListener("click", () => {
+            if (state.isSending) return;
+            closeHistoryStageView();
+            createConversation(false);
+            renderConversationList();
+            renderActiveConversation();
+        });
+    }
+
+    if (refs.historyStageCloseBtn) {
+        refs.historyStageCloseBtn.addEventListener("click", () => {
+            closeHistoryStageView();
+        });
+    }
+
+    if (refs.historyStageSearchInput) {
+        refs.historyStageSearchInput.addEventListener("input", (e) => {
+            renderHistoryStageGrid(e.target.value);
+        });
+    }
 
     refs.openSettingsBtn.addEventListener("click", () => {
         openSettings();

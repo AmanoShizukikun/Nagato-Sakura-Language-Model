@@ -63,7 +63,7 @@ def _load_state_dict(weight_path: Path) -> Dict[str, torch.Tensor]:
 
         return load_file(str(weight_path))
 
-    state_dict = torch.load(weight_path, map_location="cpu")
+    state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
     if not isinstance(state_dict, dict):
         raise TypeError(f"權重檔格式不正確: {weight_path}")
     return state_dict

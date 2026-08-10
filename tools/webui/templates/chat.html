@@ -18,8 +18,8 @@
         <aside class="left-sidebar" id="leftSidebar" aria-label="對話側欄">
             <div class="sidebar-head">
                 <div>
-                    <h2>Dialog Matrix</h2>
-                    <p>對話管理與快速切換</p>
+                    <h2>NS-LM</h2>
+                    <p>長門櫻語言模型</p>
                 </div>
                 <button type="button" id="closeSidebarBtn" class="icon-btn" aria-label="摺疊側欄" title="摺疊側欄">◀</button>
             </div>
@@ -37,6 +37,12 @@
                         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
                     </span>
                     <span class="btn-label">臨時對話</span>
+                </button>
+                <button type="button" id="collapsedHistoryBtn" class="btn ghost" title="對話歷史選擇">
+                    <span class="btn-icon" aria-hidden="true">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                    </span>
+                    <span class="btn-label">對話紀錄</span>
                 </button>
             </div>
 
@@ -92,6 +98,19 @@
                     </button>
                 </div>
             </header>
+
+            <section id="historyStagePanel" class="history-stage-panel" style="display: none;" aria-label="聊天紀錄選擇區">
+                <div class="history-stage-header">
+                    <div class="history-stage-title-wrap">
+                        <h2>📜 對話歷史選擇</h2>
+                        <span id="historyStageCount" class="history-stage-badge">0 個對話</span>
+                    </div>
+                    <div class="history-stage-controls">
+                        <input id="historyStageSearchInput" type="search" placeholder="搜尋對話標題或訊息內容..." class="history-stage-search">
+                    </div>
+                </div>
+                <div id="historyStageGrid" class="history-stage-grid"></div>
+            </section>
 
             <section id="chatList" class="chat-list" aria-live="polite"></section>
 
@@ -158,14 +177,6 @@
             </div>
 
             <div class="settings-grid">
-                <div class="settings-item">
-                    <label for="historyRounds">歷史輪次</label>
-                    <input id="historyRounds" type="number" min="0" max="40" step="1">
-                </div>
-                <div class="settings-item">
-                    <label for="maxLength">上下文長度</label>
-                    <input id="maxLength" type="number" min="128" step="128">
-                </div>
                 <div class="settings-item">
                     <label for="maxNewTokens">單輪生成 token</label>
                     <input id="maxNewTokens" type="number" min="16" step="16">
@@ -252,6 +263,7 @@
                     <button type="button" class="settings-nav-item" data-settings-section="display">顯示</button>
                     <button type="button" class="settings-nav-item" data-settings-section="shortcuts">快捷</button>
                     <button type="button" class="settings-nav-item" data-settings-section="languageTime">語言 & 時間</button>
+                    <button type="button" class="settings-nav-item" data-settings-section="modelParams">模型參數</button>
                     <button type="button" class="settings-nav-item" data-settings-section="toolRegistry">註冊工具</button>
                 </nav>
 
@@ -484,6 +496,24 @@
                         <div class="settings-block">
                             <label>Tokenizer</label>
                             <div class="mono-text" id="tokenizerPath"></div>
+                        </div>
+                    </section>
+
+                    <section class="settings-tab-panel" id="settingsSectionModelParams" data-settings-panel="modelParams" aria-label="模型參數設定">
+                        <div class="settings-block">
+                            <h3>上下文與歷史控制</h3>
+                            <div class="settings-grid settings-grid-single-mobile">
+                                <div class="settings-item">
+                                    <label for="historyRounds">對話保留歷史輪次（History Rounds）</label>
+                                    <input id="historyRounds" type="number" min="0" max="40" step="1">
+                                    <small class="field-hint">多輪對話時保留的歷史訊息對數（預設 3 輪）。設定為 0 則每次對話不攜帶歷史脈絡。</small>
+                                </div>
+                                <div class="settings-item">
+                                    <label for="maxLength">上下文長度（Context Length）</label>
+                                    <input id="maxLength" type="number" min="128" step="128">
+                                    <small class="field-hint">模型在記憶體裡同時能看到的 token 總數上限（包含輸入與輸出）。降低此值可減少 KV Cache 顯存使用；不能超過模型訓練時的 max_position_embeddings。</small>
+                                </div>
+                            </div>
                         </div>
                     </section>
                 </div>
