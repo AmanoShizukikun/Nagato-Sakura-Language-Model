@@ -1546,9 +1546,9 @@ async function loadWidget(config) {
             document.removeEventListener('touchend', onTouchEnd);
           }
 
-          document.addEventListener('touchmove', onTouchMove);
-          document.addEventListener('touchend', onTouchEnd);
-        });
+          document.addEventListener('touchmove', onTouchMove, { passive: false });
+          document.addEventListener('touchend', onTouchEnd, { passive: true });
+        }, { passive: false });
       });
     }
 
@@ -1669,9 +1669,9 @@ async function loadWidget(config) {
             document.removeEventListener('touchend', onTouchEnd);
           }
 
-          document.addEventListener('touchmove', onTouchMove);
-          document.addEventListener('touchend', onTouchEnd);
-        });
+          document.addEventListener('touchmove', onTouchMove, { passive: false });
+          document.addEventListener('touchend', onTouchEnd, { passive: true });
+        }, { passive: false });
       }
 
       // Resize: drag down to enlarge, drag up to shrink tool buttons
@@ -1723,9 +1723,9 @@ async function loadWidget(config) {
             document.removeEventListener('touchend', onTouchEnd);
           }
 
-          document.addEventListener('touchmove', onTouchMove);
-          document.addEventListener('touchend', onTouchEnd);
-        });
+          document.addEventListener('touchmove', onTouchMove, { passive: false });
+          document.addEventListener('touchend', onTouchEnd, { passive: true });
+        }, { passive: false });
       }
     }
 
@@ -1883,10 +1883,8 @@ async function loadWidget(config) {
         const offsetX = touch.clientX - rect.left;
         const offsetY = touch.clientY - rect.top;
 
-        // 計算 header 的底部（相對於 viewport），拖曳時不能超出此頂部區域
         const headerEl = document.querySelector('header');
         let headerRect = headerEl ? headerEl.getBoundingClientRect() : { bottom: 0 };
-        // Reserve titlebar height so drag range is consistent with edit mode
         const editTitlebar2 = waifu.querySelector('#waifu-edit-titlebar');
         const tbReserve2 = editTitlebar2 ? (editTitlebar2.scrollHeight || 34) : 0;
         let minTop = Math.max(0, headerRect.bottom + tbReserve2);
@@ -1898,15 +1896,12 @@ async function loadWidget(config) {
           if (!dragging) return;
           const t = ev.touches && ev.touches[0];
           if (!t) return;
-          // Ensure waifu-custom-pos is active FIRST to avoid bottom:0 conflict
           if (!waifu.classList.contains('waifu-custom-pos')) {
             waifu.classList.add('waifu-custom-pos');
           }
-          // Use dynamic size to account for resized widget
           const w = waifu.offsetWidth, h = waifu.offsetHeight;
           const x = t.clientX, y = t.clientY;
           let left = x - offsetX, top = y - offsetY;
-          // Same constraints as edit mode: header top boundary, viewport edges
           if (top < minTop) top = minTop;
           if (top > winH - Math.min(h, 50)) top = winH - Math.min(h, 50);
           if (left < 0) left = 0;
@@ -1923,7 +1918,6 @@ async function loadWidget(config) {
           if (!dragging) {
             window.dispatchEvent(new Event('live2d:tapbody'));
           } else {
-            // Save position to localStorage so toggle remembers it
             try {
               const canvas = document.getElementById('live2d');
               const canvasContainer = waifu.querySelector('#waifu-canvas');
@@ -1938,11 +1932,11 @@ async function loadWidget(config) {
           }
         }
 
-        document.addEventListener('touchmove', onTouchMove);
-        document.addEventListener('touchend', onTouchEnd);
+        document.addEventListener('touchmove', onTouchMove, { passive: false });
+        document.addEventListener('touchend', onTouchEnd, { passive: true });
 
         window.onresize = () => { winW = window.innerWidth; winH = window.innerHeight; headerRect = headerEl ? headerEl.getBoundingClientRect() : { bottom: 0 }; minTop = Math.max(0, headerRect.bottom + tbReserve2); };
-      });
+      }, { passive: false });
     }
   }
 

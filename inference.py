@@ -316,13 +316,17 @@ class NagatoSakuraInference:
             self.logger.info(f"單輪最大生成 Token 上限: {self.config.max_new_tokens} (預設為上下文長度的一半)")
             self.logger.info(f"加載模型: {self.config.model_path}")
             self.model = NagatoSakuraForCausalLM(model_config)
-            weight_files = ["model.pt", "pytorch_model.bin", "model.safetensors"]
+            weight_files = ["model.safetensors", "model.pt", "pytorch_model.bin"]
             model_loaded = False
             for weight_file in weight_files:
                 model_file_path = model_dir / weight_file
                 if model_file_path.exists():
                     try:
-                        state_dict = torch.load(model_file_path, map_location=self.device, weights_only=True)
+                        if model_file_path.suffix == ".safetensors":
+                            from safetensors.torch import load_file
+                            state_dict = load_file(str(model_file_path))
+                        else:
+                            state_dict = torch.load(model_file_path, map_location=self.device, weights_only=True)
                         self.model.load_state_dict(state_dict)
                         self.logger.info(f"模型權重從 {model_file_path} 加載完成")
                         model_loaded = True
@@ -937,7 +941,7 @@ def main() -> None:
 
     # 基本與模式設定
     req_group = parser.add_argument_group("基本與模式設定 (Basic & Mode Options)")
-    req_group.add_argument("--model_path", type=str, default="NS-LM-1.4/best_model", help="模型路徑")
+    req_group.add_argument("--model_path", type=str, default="NS-LM-1.6/best_model", help="模型路徑")
     req_group.add_argument("--tokenizer_path", type=str, help="分詞器路徑（如果未指定，將在模型路徑中查找）")
     req_group.add_argument("--mode",type=str,default="web", choices=["interactive", "single", "web"], help="推理模式: interactive=交互式對話, single=單次推理, web=啟動Web介面")
 

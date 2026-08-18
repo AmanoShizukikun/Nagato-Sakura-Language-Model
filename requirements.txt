@@ -1,4 +1,5 @@
 transformers
+safetensors
 datasets
 psutil
 GPUtil

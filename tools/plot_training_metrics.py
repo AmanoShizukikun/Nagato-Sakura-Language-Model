@@ -1,8 +1,9 @@
 import argparse
 import csv
 import importlib
+import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 def _ensure_matplotlib():
@@ -22,11 +23,12 @@ def _read_csv(file_path: Path) -> List[Dict[str, str]]:
         return list(reader)
 
 
-def _to_float(value: str, default: float = 0.0) -> float:
+def _to_float(value: str, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         if value is None or value == "":
             return default
-        return float(value)
+        f = float(value)
+        return f if math.isfinite(f) else default
     except (TypeError, ValueError):
         return default
 
@@ -37,10 +39,10 @@ def _plot_step_metrics(step_rows: List[Dict[str, str]], output_dir: Path):
 
     plt = _ensure_matplotlib()
 
-    steps = [_to_float(r.get("global_step")) for r in step_rows]
-    losses = [_to_float(r.get("train_loss")) for r in step_rows]
-    loss_ema = [_to_float(r.get("loss_ema")) for r in step_rows]
-    grad_norm = [_to_float(r.get("grad_norm")) for r in step_rows]
+    steps = [_to_float(r.get("global_step"), 0.0) for r in step_rows]
+    losses = [_to_float(r.get("train_loss"), 0.0) for r in step_rows]
+    loss_ema = [_to_float(r.get("loss_ema"), 0.0) for r in step_rows]
+    grad_norm = [_to_float(r.get("grad_norm"), 0.0) for r in step_rows]
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), dpi=150)
 
@@ -70,9 +72,20 @@ def _plot_eval_metrics(eval_rows: List[Dict[str, str]], output_dir: Path):
 
     plt = _ensure_matplotlib()
 
-    epochs = [_to_float(r.get("epoch")) for r in eval_rows]
-    eval_loss = [_to_float(r.get("eval_loss")) for r in eval_rows]
-    ppl = [_to_float(r.get("perplexity")) for r in eval_rows]
+    epochs = []
+    eval_loss = []
+    ppl = []
+    for r in eval_rows:
+        el = _to_float(r.get("eval_loss"), default=None)
+        p = _to_float(r.get("perplexity"), default=None)
+        ep = _to_float(r.get("epoch"), default=None)
+        if el is not None and ep is not None:
+            epochs.append(ep)
+            eval_loss.append(el)
+            ppl.append(p if p is not None else 0.0)
+
+    if not epochs:
+        return
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), dpi=150)
 
@@ -121,7 +134,7 @@ def _plot_system_metrics(step_rows: List[Dict[str, str]], output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot training curves from CSV metrics")
-    parser.add_argument("--metrics_dir", type=str, default="NS-LLM-0.2/metrics", help="metrics 目錄")
+    parser.add_argument("--metrics_dir", type=str, default="NS-LM-1.6/metrics", help="metrics 目錄")
     parser.add_argument("--output_dir", type=str, default=None, help="圖表輸出目錄，預設為 metrics/plots")
     args = parser.parse_args()
 

@@ -250,6 +250,7 @@ def _run_training(args: argparse.Namespace, rank: int, world_size: int, is_distr
             dataloader_persistent_workers=args.dataloader_persistent_workers,
             dataloader_drop_last=args.dataloader_drop_last,
             pack_sequences=args.pack_sequences,
+            save_format=args.save_format,
         )
 
     except Exception as e:
@@ -274,7 +275,7 @@ def main() -> None:
     # 數據設定
     data_group = parser.add_argument_group("數據設定 (Data Configurations)")
     data_group.add_argument("--training_data_file", type=str, help="訓練數據來源（檔案或資料夾）；未指定時使用 data/train")
-    data_group.add_argument("--output_dir", type=str, default="NS-LM-1.6-pico", help="輸出目錄")
+    data_group.add_argument("--output_dir", type=str, default="NS-LM-1.6", help="輸出目錄")
     data_group.add_argument("--force_retrain_tokenizer", action="store_true", help="強制重新訓練分詞器")
     data_group.add_argument("--eval_split_ratio", type=float, default=0.0, help="評估集分割比例（使用固定評估集時請設為0）")
     data_group.add_argument("--eval_data_file", type=str, help="固定評估集來源（檔案或資料夾）；未指定時使用 data/eval")
@@ -305,11 +306,11 @@ def main() -> None:
     model_group.add_argument("--no_tokenizer_enable_symbols", action="store_false", dest="tokenizer_enable_symbols", help="禁用通用標點符號保底")
     model_group.add_argument("--tokenizer_enable_programming", action="store_true", default=False, help="啟用程式關鍵字保底")
     model_group.add_argument("--no_tokenizer_enable_programming", action="store_false", dest="tokenizer_enable_programming", help="禁用程式關鍵字保底")
-    model_group.add_argument("--hidden_size", type=int, default=128, help="隱藏層大小")
-    model_group.add_argument("--num_layers", type=int, default=2, help="層數")
-    model_group.add_argument("--num_heads", type=int, default=2, help="注意力頭數")
-    model_group.add_argument("--num_key_value_heads", type=int, default=1, help="GQA 的 key/value 頭數")
-    model_group.add_argument("--intermediate_size", type=int, default=256, help="MLP中間層大小")
+    model_group.add_argument("--hidden_size", type=int, default=512, help="隱藏層大小")
+    model_group.add_argument("--num_layers", type=int, default=12, help="層數")
+    model_group.add_argument("--num_heads", type=int, default=8, help="注意力頭數")
+    model_group.add_argument("--num_key_value_heads", type=int, default=2, help="GQA 的 key/value 頭數")
+    model_group.add_argument("--intermediate_size", type=int, default=1408, help="MLP中間層大小")
     model_group.add_argument("--max_seq_length", type=int, default=4096, help="最大序列長度")
     model_group.add_argument("--memory_tokens", type=int, default=0, help="記憶令牌數量")
     model_group.add_argument("--quantize_kv_cache", action="store_true", default=False, help="啟用 KV cache 量化")
@@ -324,17 +325,17 @@ def main() -> None:
 
     # 訓練參數
     train_group = parser.add_argument_group("訓練參數 (Training Hyperparameters)")
-    train_group.add_argument("--batch_size", type=int, default=4, help="批次大小")
+    train_group.add_argument("--batch_size", type=int, default=1, help="批次大小")
     train_group.add_argument("--gradient_accumulation_steps", type=int, default=4, help="梯度累積步數")
-    train_group.add_argument("--num_epochs", type=int, default=30, help="訓練輪數")
+    train_group.add_argument("--num_epochs", type=int, default=5, help="訓練輪數")
     train_group.add_argument("--learning_rate", type=float, default=5e-4, help="學習率")
     train_group.add_argument("--weight_decay", type=float, default=0.005, help="權重衰減")
     train_group.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["linear", "cosine", "onecycle"], help="學習率調度器類型")
-    train_group.add_argument("--warmup_ratio", type=float, default=0.03, help="預熱比例")
+    train_group.add_argument("--warmup_ratio", type=float, default=0.01, help="預熱比例")
     train_group.add_argument("--max_grad_norm", type=float, default=0.7, help="梯度裁剪閾值")
     train_group.add_argument("--gradient_checkpointing", action="store_true", default=False, help="啟用梯度檢查點 (節省顯存，但增加額外計算量；小模型建議預設關閉以最大化 GPU 吞吐量)")
     train_group.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing", help="禁用梯度檢查點")
-    train_group.add_argument("--scheduler_target_epochs", type=int, default=150, help="學習率調度目標epoch（可低於實際訓練輪數）")
+    train_group.add_argument("--scheduler_target_epochs", type=int, default=5, help="學習率調度目標epoch（可低於實際訓練輪數）")
     train_group.add_argument("--pretokenize_batch_size", type=int, default=1024, help="預分詞批次大小")
     train_group.add_argument("--pretokenize_num_proc", type=int, default=1, help="預分詞進程數（預設 1，充分利用 Rust 原生 Rayon 滿核並行加速）")
     train_group.add_argument("--pretokenize_cache", action="store_true", default=True, help="啟用預分詞快取")
@@ -365,10 +366,10 @@ def main() -> None:
     checkpoint_group = parser.add_argument_group("日誌與 Checkpoint 設定 (Logging & Checkpoints)")
     checkpoint_group.add_argument("--log_interval", type=int, default=1, help="日誌記錄間隔（按epoch）")
     checkpoint_group.add_argument("--save_interval_epochs", type=int, default=5, help="按epoch保存間隔")
-    checkpoint_group.add_argument("--early_stopping_patience", type=int, default=30, help="早停耐心值（按epoch）")
+    checkpoint_group.add_argument("--early_stopping_patience", type=int, default=10, help="早停耐心值（按epoch）")
     checkpoint_group.add_argument("--early_stopping_monitor",type=str,default="train_loss",choices=["train_loss", "eval_loss"],help="早停監控指標")
     checkpoint_group.add_argument("--early_stopping_min_delta", type=float, default=0.0001, help="早停最小改善幅度")
-    checkpoint_group.add_argument("--early_stopping_warmup_epochs", type=int, default=8, help="早停啟用前的預熱epoch")
+    checkpoint_group.add_argument("--early_stopping_warmup_epochs", type=int, default=1, help="早停啟用前的預熱epoch")
     checkpoint_group.add_argument("--eval_interval_epochs", type=int, default=1, help="評估間隔（按epoch）")
     checkpoint_group.add_argument("--eval_short_max_tokens", type=int, default=64, help="短樣本分桶上限token數")
     checkpoint_group.add_argument("--eval_medium_max_tokens", type=int, default=256, help="中樣本分桶上限token數")
@@ -381,6 +382,7 @@ def main() -> None:
     checkpoint_group.add_argument("--resume_checkpoint", type=str, help="指定恢復的checkpoint路徑（可為相對或絕對路徑）")
     checkpoint_group.add_argument("--resume_model_only", action="store_true", help="僅恢復模型權重，不恢復 optimizer/scheduler/scaler 與 step/epoch")
     checkpoint_group.add_argument("--resume_lr_scale", type=float, default=0.0, help="續訓後套用學習率縮放（<=0 代表自動對齊到 --learning_rate；例如 0.5 代表將當前LR減半）")
+    checkpoint_group.add_argument("--save_format", type=str, default="safetensors", choices=["safetensors", "pt"], help="模型權重保存格式 (預設: safetensors，僅保存權重；.pt 僅用於 training_state 續訓狀態)")
 
     # 其他系統參數
     other_group = parser.add_argument_group("其他系統參數 (Other Systems)")

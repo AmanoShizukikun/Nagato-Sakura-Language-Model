@@ -141,19 +141,25 @@ class CheckpointManager:
         for d in sorted(unique_dirs, key=lambda p: p.stat().st_mtime, reverse=True):
             resolved = str(d.resolve())
             record = record_map.get(resolved)
+            raw_eval_loss = record.get("eval_loss") if record else None
+            eval_loss_val = (
+                round(float(raw_eval_loss), 4)
+                if raw_eval_loss is not None and math.isfinite(float(raw_eval_loss))
+                else None
+            )
             row = {
                 "checkpoint_name": d.name,
                 "checkpoint_path": str(d),
                 "epoch": record.get("epoch") if record else self._parse_epoch_from_name(d.name),
-                "eval_loss": record.get("eval_loss") if record else None,
+                "eval_loss": eval_loss_val,
                 "is_best": bool(record.get("is_best")) if record else (d.name == "best_model"),
                 "reasons": "|".join(record.get("reasons", [])) if record else "",
-                "size_mb": round(self._folder_size_mb(d), 3),
+                "size_mb": round(self._folder_size_mb(d), 2),
                 "modified_time": datetime.utcfromtimestamp(d.stat().st_mtime).isoformat(
                     timespec="seconds"
                 )
                 + "Z",
-                "has_model": (d / "model.pt").exists(),
+                "has_model": (d / "model.safetensors").exists() or (d / "model.pt").exists() or (d / "pytorch_model.bin").exists(),
                 "has_state": (d / "training_state.pt").exists(),
             }
             rows.append(row)
@@ -175,7 +181,11 @@ class CheckpointManager:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             for row in rows:
-                writer.writerow(row)
+                csv_row = {
+                    k: ("" if row.get(k) is None else row.get(k))
+                    for k in headers
+                }
+                writer.writerow(csv_row)
 
         valid_eval_rows = [r for r in rows if r.get("eval_loss") is not None and math.isfinite(float(r["eval_loss"]))]
         best_row = (min(valid_eval_rows, key=lambda x: float(x["eval_loss"])) if valid_eval_rows else None)
@@ -183,7 +193,7 @@ class CheckpointManager:
         overview = {
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "total_checkpoints": len(rows),
-            "total_size_mb": round(sum(float(r.get("size_mb", 0.0)) for r in rows), 3),
+            "total_size_mb": round(sum(float(r.get("size_mb", 0.0)) for r in rows), 2),
             "best_checkpoint_path": best_row.get("checkpoint_path") if best_row else "",
             "best_eval_loss": best_row.get("eval_loss") if best_row else None,
             "latest_checkpoint_path": latest_row.get("checkpoint_path") if latest_row else "",

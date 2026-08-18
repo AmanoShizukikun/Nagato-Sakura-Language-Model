@@ -2571,6 +2571,29 @@ body.reduced-motion *::after {
     background: rgba(255, 255, 255, 0.1);
 }
 
+.composer-btn.disabled {
+    opacity: 0.45;
+    cursor: pointer;
+}
+
+.composer-btn.send-btn {
+    color: var(--c-cyan, #00d4ff);
+}
+
+.composer-btn.send-btn:hover {
+    color: #ffffff;
+    background: rgba(0, 212, 255, 0.2);
+}
+
+.composer-btn.send-btn.is-stop {
+    color: var(--c-pink, #ff2a85);
+}
+
+.composer-btn.send-btn.is-stop:hover {
+    color: #ffffff;
+    background: rgba(255, 42, 133, 0.25);
+}
+
 #promptInput::-webkit-scrollbar {
     width: 6px;
 }

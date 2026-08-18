@@ -156,6 +156,8 @@ const refs = {
     jumpToLatestBtn: document.getElementById("jumpToLatestBtn"),
     composerWrap: document.querySelector(".composer-wrap"),
     promptInput: document.getElementById("promptInput"),
+    sendBtn: document.getElementById("sendBtn"),
+    micBtn: document.getElementById("micBtn"),
     voiceVisualizer: document.getElementById("voiceVisualizer"),
     toast: document.getElementById("toast"),
     collapsedHistoryBtn: document.getElementById("collapsedHistoryBtn"),
@@ -631,8 +633,18 @@ function applyFeatureToggles(forceRender = false) {
     }
 
     if (refs.micBtn) {
-        refs.micBtn.disabled = !voiceInputEnabled;
-        refs.micBtn.setAttribute("title", voiceInputEnabled ? "語音輸入" : "語音輸入已停用");
+        refs.micBtn.disabled = false;
+        refs.micBtn.classList.toggle("disabled", !voiceInputEnabled);
+        if (!canUseVoiceTranscription) {
+            refs.micBtn.setAttribute("aria-label", "語音輸入（未安裝 Whisper 套件）");
+            refs.micBtn.setAttribute("title", "未安裝 Whisper 套件，語音輸入功能無法使用");
+        } else if (!voiceInputEnabled) {
+            refs.micBtn.setAttribute("aria-label", "語音輸入（已在設定中停用）");
+            refs.micBtn.setAttribute("title", "語音輸入已在註冊工具中停用");
+        } else {
+            refs.micBtn.setAttribute("aria-label", "語音輸入");
+            refs.micBtn.setAttribute("title", "語音輸入");
+        }
     }
 
     document.body.classList.toggle("feature-history-disabled", !feature.conversationHistory);
@@ -1712,9 +1724,16 @@ function openSettings() {
 }
 
 function closeSettings() {
-    refs.settingsModal.classList.remove("open");
-    refs.settingsModal.setAttribute("aria-hidden", "true");
-    refs.settingsBackdrop.classList.remove("show");
+    if (document.activeElement && refs.settingsModal && refs.settingsModal.contains(document.activeElement)) {
+        document.activeElement.blur();
+    }
+    if (refs.settingsModal) {
+        refs.settingsModal.classList.remove("open");
+        refs.settingsModal.setAttribute("aria-hidden", "true");
+    }
+    if (refs.settingsBackdrop) {
+        refs.settingsBackdrop.classList.remove("show");
+    }
     stopAllMediaTests();
 }
 
@@ -1889,7 +1908,7 @@ async function initModel3dViewer() {
         defaultRadius: 4.5
     };
 
-    const clock = new window.THREE.Clock();
+    let lastTime = performance.now();
     const modelGroup = new window.THREE.Group();
     scene.add(modelGroup);
     let gridHelper = null;
@@ -2030,7 +2049,6 @@ async function initModel3dViewer() {
                         transparent: m.transparent || false,
                         opacity: m.opacity !== undefined ? m.opacity : 1,
                         alphaMap: m.alphaMap || null,
-                        skinning: true,
                     });
                     return basic;
                 });
@@ -2107,8 +2125,7 @@ async function initModel3dViewer() {
                         transparent: true,
                         side: window.THREE.DoubleSide,
                         depthWrite: false,
-                        blending: window.THREE.AdditiveBlending,
-                        skinning: true
+                        blending: window.THREE.AdditiveBlending
                     });
                     return holoMat;
                 });
@@ -2308,7 +2325,9 @@ async function initModel3dViewer() {
     let _fc = 0;
     let holoTime = 0;
     function animate() {
-        const delta = Math.min(clock.getDelta(), 0.05);
+        const now = performance.now();
+        const delta = Math.min((now - lastTime) / 1000, 0.05);
+        lastTime = now;
         if (document.body.classList.contains("video-call-open") && activeCallMode === "model3d") {
             if (state.needsResize) {
                 resize();
@@ -2433,6 +2452,9 @@ function openVideoCallModal(mode = "live2d") {
 function closeVideoCallModal() {
     if (!refs.videoCallModal || !refs.callBackdrop) {
         return;
+    }
+    if (document.activeElement && refs.videoCallModal.contains(document.activeElement)) {
+        document.activeElement.blur();
     }
     refs.videoCallModal.classList.remove("open");
     refs.videoCallModal.setAttribute("aria-hidden", "true");
@@ -3285,7 +3307,7 @@ function deleteConversation(conversationId) {
         }
     }
 
-    saveConversationsToStorage();
+    persistConversations();
     renderConversationList();
     renderActiveConversation();
 }
@@ -3468,11 +3490,11 @@ async function sendPrompt(options = {}) {
     state.isSending = true;
     currentAbortController = new AbortController();
 
-    if (refs.micBtn) {
-        refs.micBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"/></svg>`;
-        refs.micBtn.style.color = "var(--c-pink)";
-        refs.micBtn.setAttribute("aria-label", "停止生成");
-        refs.micBtn.setAttribute("title", "停止生成");
+    if (refs.sendBtn) {
+        refs.sendBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"/></svg>`;
+        refs.sendBtn.classList.add("is-stop");
+        refs.sendBtn.setAttribute("aria-label", "中斷生成");
+        refs.sendBtn.setAttribute("title", "中斷生成");
     }
 
     setStatus("generating");
@@ -3638,11 +3660,11 @@ async function sendPrompt(options = {}) {
     } finally {
         state.isSending = false;
         currentAbortController = null;
-        if (refs.micBtn) {
-            refs.micBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>`;
-            refs.micBtn.style.color = "";
-            refs.micBtn.setAttribute("aria-label", "語音輸入");
-            refs.micBtn.setAttribute("title", "語音輸入");
+        if (refs.sendBtn) {
+            refs.sendBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>`;
+            refs.sendBtn.classList.remove("is-stop");
+            refs.sendBtn.setAttribute("aria-label", "送出");
+            refs.sendBtn.setAttribute("title", "送出");
         }
         refs.promptInput.focus();
     }
@@ -4102,19 +4124,36 @@ function bindEvents() {
     let audioChunks = [];
     let isRecording = false;
 
-    if (refs.micBtn) {
-        refs.micBtn.addEventListener("click", async () => {
+    if (refs.sendBtn) {
+        refs.sendBtn.addEventListener("click", () => {
             if (state.isSending) {
                 if (currentAbortController) {
                     currentAbortController.abort();
                 }
+            } else {
+                void sendPrompt();
+            }
+        });
+    }
+
+    if (refs.micBtn) {
+        refs.micBtn.addEventListener("click", async () => {
+            if (state.isSending) {
+                showToast("訊息生成中，無法使用語音輸入");
                 return;
             }
 
             const capabilities = bootstrap.capabilities || {};
-            const voiceEnabled = (!state.settings || state.settings.featureToggles.voiceInput !== false) && capabilities.voiceTranscription !== false;
-            if (!voiceEnabled) {
-                showToast(capabilities.voiceTranscription === false ? "語音轉錄後端未啟用" : "語音輸入已在註冊工具中停用");
+            const canUseVoice = capabilities.voiceTranscription !== false;
+            const featureEnabled = !state.settings || state.settings.featureToggles.voiceInput !== false;
+
+            if (!canUseVoice) {
+                showToast("未安裝 Whisper 套件，語音輸入功能無法使用");
+                return;
+            }
+
+            if (!featureEnabled) {
+                showToast("語音輸入已在註冊工具設定中停用");
                 return;
             }
 

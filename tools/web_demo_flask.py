@@ -281,6 +281,11 @@ def index():
     return render_template("chat.html", bootstrap=bootstrap)
 
 
+@app.get("/favicon.ico")
+def favicon():
+    return "", 204
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "backend": "flask", "model_loaded": INFERENCE_INSTANCE is not None})

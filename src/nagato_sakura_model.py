@@ -2502,8 +2502,26 @@ class NagatoSakuraForCausalLM(nn.Module):
         save_directory.mkdir(parents=True, exist_ok=True)
 
         try:
-            # 保存模型權重
-            torch.save(self.state_dict(), save_directory / "pytorch_model.bin")
+            # 保存模型權重 (優先 Safetensors)
+            try:
+                from safetensors.torch import save_file
+
+                state_dict = self.state_dict()
+                seen_ptrs = set()
+                contiguous_dict = {}
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        ptr = v.data_ptr()
+                        if ptr in seen_ptrs:
+                            contiguous_dict[k] = v.clone().detach().cpu()
+                        else:
+                            seen_ptrs.add(ptr)
+                            contiguous_dict[k] = v.contiguous().cpu()
+                    else:
+                        contiguous_dict[k] = v
+                save_file(contiguous_dict, str(save_directory / "model.safetensors"))
+            except ImportError:
+                torch.save(self.state_dict(), save_directory / "pytorch_model.bin")
 
             # 保存配置
             config_dict = self.config.to_dict()
@@ -2557,13 +2575,28 @@ class NagatoSakuraForCausalLM(nn.Module):
             # 創建模型
             model = cls(config)
 
-            # 加載權重
-            weights_path = model_path / "pytorch_model.bin"
-            if not weights_path.exists():
-                raise FileNotFoundError("未找到模型權重文件 pytorch_model.bin")
-
             device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-            state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+
+            # 加載權重 (優先 safetensors，相容 pytorch_model.bin 與 model.pt)
+            safetensors_path = model_path / "model.safetensors"
+            bin_path = model_path / "pytorch_model.bin"
+            pt_path = model_path / "model.pt"
+
+            if safetensors_path.exists():
+                try:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_path), device=str(device))
+                except Exception:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_path))
+            elif bin_path.exists():
+                state_dict = torch.load(bin_path, map_location=device, weights_only=True)
+            elif pt_path.exists():
+                state_dict = torch.load(pt_path, map_location=device, weights_only=True)
+            else:
+                raise FileNotFoundError(f"未在 {model_path} 找到模型權重文件 (model.safetensors / pytorch_model.bin / model.pt)")
 
             model.load_state_dict(state_dict)
             model = model.to(device)

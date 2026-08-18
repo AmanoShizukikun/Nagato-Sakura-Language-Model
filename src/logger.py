@@ -1,5 +1,6 @@
 import csv
 import logging
+import math
 import os
 import sys
 import threading
@@ -20,6 +21,50 @@ except ImportError:
 
 
 import copy
+
+
+def format_metric_value(key: str, val: Any) -> Any:
+    """統一格式化指標數值，防止 16 位浮點數與 nan/inf 污染 CSV。"""
+    if val is None or val == "":
+        return ""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int):
+        return val
+
+    # 嘗試將字串數字轉為浮點數處理
+    f_val = None
+    if isinstance(val, (int, float)):
+        f_val = float(val)
+    elif isinstance(val, str):
+        try:
+            f_val = float(val.strip())
+        except ValueError:
+            return val
+
+    if f_val is not None:
+        if not math.isfinite(f_val):
+            return ""
+        k_lower = key.lower()
+        if "lr" in k_lower or "learning_rate" in k_lower:
+            return f"{f_val:.2e}"
+        if "loss" in k_lower:
+            return f"{f_val:.4f}"
+        if "perplexity" in k_lower or "ppl" in k_lower:
+            return f"{f_val:.2f}"
+        if "norm" in k_lower:
+            return f"{f_val:.3f}"
+        if "time" in k_lower or "sec" in k_lower or "tokens_per_sec" in k_lower:
+            return f"{f_val:.2f}"
+        if "percent" in k_lower or "pct" in k_lower:
+            return f"{f_val:.1f}"
+        if "mb" in k_lower or "gb" in k_lower:
+            return f"{f_val:.2f}"
+        if "ratio" in k_lower:
+            return f"{f_val:.4f}"
+        return f"{f_val:.4f}"
+
+    return val
 
 
 class ColoredFormatter(logging.Formatter):
@@ -138,16 +183,6 @@ class CSVMetricsWriter:
             "message",
             "value",
         ],
-        "checkpoint_metrics.csv": [
-            "timestamp",
-            "epoch",
-            "global_step",
-            "checkpoint_name",
-            "checkpoint_path",
-            "eval_loss",
-            "is_best",
-            "reasons",
-        ],
         "training_summary.csv": [
             "timestamp",
             "run_status",
@@ -189,8 +224,10 @@ class CSVMetricsWriter:
                     writer.writeheader()
 
     def _write_row(self, filename: str, row: Dict[str, Any]):
-        headers = self.SCHEMAS[filename]
-        payload = {k: row.get(k, "") for k in headers}
+        headers = self.SCHEMAS.get(filename)
+        if not headers:
+            return
+        payload = {k: format_metric_value(k, row.get(k, "")) for k in headers}
         if not payload.get("timestamp"):
             payload["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -209,7 +246,8 @@ class CSVMetricsWriter:
         self._write_row("events.csv", row)
 
     def log_checkpoint_metrics(self, row: Dict[str, Any]):
-        self._write_row("checkpoint_metrics.csv", row)
+        # Checkpoint 資訊統一由 CheckpointManager 維護於 checkpoint_index.csv，此處保留介面以相容
+        pass
 
     def log_training_summary(self, row: Dict[str, Any]):
         self._write_row("training_summary.csv", row)

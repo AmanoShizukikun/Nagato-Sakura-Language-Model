@@ -218,7 +218,11 @@ class AdvancedNagatoSakuraTrainer:
         self._scheduler_step_offset: int = 0
         self._last_resume_scheduler_alignment_reasons: List[str] = []
         best_model_dir = self.output_dir / "best_model"
-        if (best_model_dir / "model.pt").exists():
+        if (
+            (best_model_dir / "model.safetensors").exists()
+            or (best_model_dir / "model.pt").exists()
+            or (best_model_dir / "pytorch_model.bin").exists()
+        ):
             self.best_checkpoint_path = best_model_dir
         self.use_wandb = bool(use_wandb and self.is_main_process)
 
@@ -1761,6 +1765,7 @@ class AdvancedNagatoSakuraTrainer:
         is_best: bool = False,
         checkpoint_reasons: Optional[List[str]] = None,
         eval_loss: Optional[float] = None,
+        save_format: str = "safetensors",
     ) -> Optional[Path]:
         """保存檢查點"""
         
@@ -1772,7 +1777,32 @@ class AdvancedNagatoSakuraTrainer:
 
         try:
             model_to_save = self._unwrap_model()
-            torch.save(model_to_save.state_dict(), checkpoint_dir / "model.pt")
+            save_fmt = str(save_format).strip().lower()
+            if save_fmt == "safetensors":
+                try:
+                    from safetensors.torch import save_file
+
+                    state_dict = model_to_save.state_dict()
+                    seen_ptrs = set()
+                    contiguous_dict = {}
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            ptr = v.data_ptr()
+                            if ptr in seen_ptrs:
+                                contiguous_dict[k] = v.clone().detach().cpu()
+                            else:
+                                seen_ptrs.add(ptr)
+                                contiguous_dict[k] = v.contiguous().cpu()
+                        else:
+                            contiguous_dict[k] = v
+                    save_file(contiguous_dict, str(checkpoint_dir / "model.safetensors"))
+                except ImportError:
+                    self.logger.warning(
+                        "未安裝 safetensors 套件，回退使用 torch.save 保存 model.pt (請執行: pip install safetensors)"
+                    )
+                    torch.save(model_to_save.state_dict(), checkpoint_dir / "model.pt")
+            else:
+                torch.save(model_to_save.state_dict(), checkpoint_dir / "model.pt")
             with open(checkpoint_dir / "config.json", "w", encoding="utf-8") as f:
                 json.dump(vars(self.model_config), f, indent=2, ensure_ascii=False)
             if self.tokenizer_manager.tokenizer_object:
@@ -1987,10 +2017,26 @@ class AdvancedNagatoSakuraTrainer:
                 )
 
             # 加載模型
-            model_path = checkpoint_path / "model.pt"
-            if model_path.exists():
+            safetensors_path = checkpoint_path / "model.safetensors"
+            pt_path = checkpoint_path / "model.pt"
+            bin_path = checkpoint_path / "pytorch_model.bin"
+            state_dict = None
+            if safetensors_path.exists():
+                try:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_path), device=str(self.device))
+                except Exception:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_path))
+            elif pt_path.exists():
+                state_dict = torch.load(pt_path, map_location=self.device, weights_only=True)
+            elif bin_path.exists():
+                state_dict = torch.load(bin_path, map_location=self.device, weights_only=True)
+
+            if state_dict is not None:
                 model_to_load = self._unwrap_model()
-                state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
                 checkpoint_embed = state_dict.get("model.embed_tokens.weight")
                 checkpoint_lm_head = state_dict.get("lm_head.weight")
                 current_embed_shape = tuple(model_to_load.model.embed_tokens.weight.shape)
@@ -2028,21 +2074,46 @@ class AdvancedNagatoSakuraTrainer:
         """回滾到最佳模型權重"""
         
         best_model_dir = self.output_dir / "best_model"
-        best_model_path = best_model_dir / "model.pt"
-        target_path = None
-        if best_model_path.exists():
-            target_path = best_model_path
-        elif self.best_checkpoint_path is not None:
-            candidate = self.best_checkpoint_path / "model.pt"
-            if candidate.exists():
-                target_path = candidate
+        target_dir = None
+        if (
+            (best_model_dir / "model.safetensors").exists()
+            or (best_model_dir / "model.pt").exists()
+            or (best_model_dir / "pytorch_model.bin").exists()
+        ):
+            target_dir = best_model_dir
+        elif self.best_checkpoint_path is not None and (
+            (self.best_checkpoint_path / "model.safetensors").exists()
+            or (self.best_checkpoint_path / "model.pt").exists()
+            or (self.best_checkpoint_path / "pytorch_model.bin").exists()
+        ):
+            target_dir = self.best_checkpoint_path
 
-        if target_path is None:
+        if target_dir is None:
             return False
 
         try:
             model_to_load = self._unwrap_model()
-            model_to_load.load_state_dict(torch.load(target_path, map_location=self.device, weights_only=True))
+            safetensors_file = target_dir / "model.safetensors"
+            pt_file = target_dir / "model.pt"
+            bin_file = target_dir / "pytorch_model.bin"
+            state_dict = None
+            if safetensors_file.exists():
+                try:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_file), device=str(self.device))
+                except Exception:
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(str(safetensors_file))
+            elif pt_file.exists():
+                state_dict = torch.load(pt_file, map_location=self.device, weights_only=True)
+            elif bin_file.exists():
+                state_dict = torch.load(bin_file, map_location=self.device, weights_only=True)
+            else:
+                return False
+
+            model_to_load.load_state_dict(state_dict)
             return True
         except Exception as e:
             self.logger.warning(f"回滾最佳模型失敗: {e}")
@@ -2103,15 +2174,15 @@ class AdvancedNagatoSakuraTrainer:
             "epochs_planned": int(epochs_planned),
             "epochs_completed": int(epochs_completed),
             "global_step": int(self.global_step),
-            "best_eval_loss": best_record.get("eval_loss") if best_record else None,
+            "best_eval_loss": round(float(best_record["eval_loss"]), 4) if best_record and best_record.get("eval_loss") is not None else None,
             "best_eval_epoch": best_record.get("epoch") if best_record else None,
-            "final_eval_loss": final_eval_loss,
-            "final_perplexity": final_perplexity,
+            "final_eval_loss": round(float(final_eval_loss), 4) if final_eval_loss is not None else None,
+            "final_perplexity": round(float(final_perplexity), 2) if final_perplexity is not None else None,
             "total_tokens_seen": int(run_aggregates.get("tokens_seen", 0)),
             "invalid_loss_count": int(run_aggregates.get("invalid_loss_count", 0)),
             "invalid_grad_count": int(run_aggregates.get("invalid_grad_count", 0)),
             "skipped_update_count": int(run_aggregates.get("skipped_update_count", 0)),
-            "run_time_sec": round(run_time_sec, 3),
+            "run_time_sec": round(run_time_sec, 2),
             "best_checkpoint_path": (checkpoint_overview or {}).get("best_checkpoint_path", ""),
             "latest_checkpoint_path": (checkpoint_overview or {}).get("latest_checkpoint_path", ""),
             "best_bucket_metrics": best_bucket_metrics,
@@ -2123,12 +2194,12 @@ class AdvancedNagatoSakuraTrainer:
             "eval_history": eval_history,
         }
 
-        now_tag = time.strftime("%Y%m%d_%H%M%S")
+        # 輸出單一標準的 training_summary.json (及相容 latest 檔案，不產生零散 timestamp JSON 副本)
+        summary_json = metrics_dir / "training_summary.json"
         latest_json = metrics_dir / "training_summary_latest.json"
-        timed_json = metrics_dir / f"training_summary_{now_tag}.json"
-        with open(latest_json, "w", encoding="utf-8") as f:
+        with open(summary_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        with open(timed_json, "w", encoding="utf-8") as f:
+        with open(latest_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
         csv_row = {
@@ -2198,6 +2269,7 @@ class AdvancedNagatoSakuraTrainer:
         dataloader_persistent_workers: bool = True,
         dataloader_drop_last: bool = True,
         pack_sequences: bool = True,
+        save_format: str = "safetensors",
     ):
         """主訓練函數"""
         
@@ -2619,6 +2691,7 @@ class AdvancedNagatoSakuraTrainer:
                         is_best=is_best,
                         checkpoint_reasons=save_reasons,
                         eval_loss=eval_loss,
+                        save_format=save_format,
                     )
                     if checkpoint_path is not None:
                         self.checkpoint_manager.register_checkpoint(
@@ -2665,6 +2738,7 @@ class AdvancedNagatoSakuraTrainer:
                 is_best=False,
                 checkpoint_reasons=["final_export"],
                 eval_loss=self.best_eval_loss if math.isfinite(self.best_eval_loss) else None,
+                save_format=save_format,
             )
 
             if final_checkpoint_path is not None and self.checkpoint_manager is not None:
@@ -2709,6 +2783,7 @@ class AdvancedNagatoSakuraTrainer:
                 is_best=False,
                 checkpoint_reasons=["interrupted"],
                 eval_loss=None,
+                save_format=save_format,
             )
         except Exception as e:
             run_status = "failed"
